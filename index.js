@@ -595,7 +595,7 @@ async function readAgentStore() {
     return []
   }
   try {
-    const parsed = JSON.parse(text)
+    const parsed = JSON.parse(text.replace(/^\uFEFF/, ''))
     const list = Array.isArray(parsed?.agents) ? parsed.agents : []
     return list
       .filter((agent) => agent && typeof agent.name === 'string' && agent.name !== '')
@@ -637,7 +637,7 @@ async function readBindings() {
     return emptyBindings()
   }
   try {
-    const parsed = JSON.parse(text)
+    const parsed = JSON.parse(text.replace(/^\uFEFF/, ''))
     const bindings = parsed?.bindings
     if (bindings === null || typeof bindings !== 'object' || Array.isArray(bindings)) return emptyBindings()
     return { version: 1, bindings }
@@ -950,7 +950,7 @@ const MAX_CHILD_RULES = 200
 async function readChildRules() {
   try {
     const text = await fs.readFile(childrenFile(), 'utf8')
-    const parsed = JSON.parse(text)
+    const parsed = JSON.parse(text.replace(/^\uFEFF/, ''))
     const children = parsed?.children
     if (children === null || typeof children !== 'object' || Array.isArray(children)) return {}
     return children
