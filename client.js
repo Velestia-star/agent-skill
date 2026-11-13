@@ -1626,6 +1626,7 @@ window.__ModuleLoader__.load({
       const [skillError, setSkillError] = useState(null)
       const [toast, setToast] = useState(null)
       const [confirm, setConfirm] = useState(null)
+      const [drag, setDrag] = useState(null)
       const toastTimer = useRef(0)
 
       const showToast = useCallback((text) => {
