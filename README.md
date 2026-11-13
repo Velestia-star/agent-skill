@@ -55,6 +55,16 @@ Delegate a review of src/app.ts to the subagent "code-reviewer".
 
 The model calls `delegate_agent`, which starts the child through `ctx.subagents` and returns its session id; the runtime notifies the parent when the child finishes.
 
+#### Hard trigger: `/chief <task>`
+
+When you want no model judgement at all, type a slash command in the composer:
+
+```text
+/chief 把设置页的保存按钮改成 loading 态，只动 src/settings.tsx，回报交付物/证据/遗留
+```
+
+`/chief` starts the subagent named `chief` (or its display name / unique prefix) directly from the Host, skips the model turn, and returns a command result with the child session id. The child reports back into this session when it finishes. The command reuses the same skill injection, model route, depth policy and tool allowlist as `delegate_agent`. An empty input returns `用法：/chief <任务>`; a missing agent returns the available names.
+
 ### 2. Create a skill
 
 **New** under *Skills*:

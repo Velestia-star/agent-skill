@@ -55,6 +55,16 @@ dsh plugin install /absolute/path/to/dsh-agent-skill
 
 模型会调用 `delegate_agent`，通过 `ctx.subagents` 起子会话并拿回它的 session id；子智能体跑完后运行时会通知父会话。
 
+#### 硬触发：`/chief <任务>`
+
+不想让主模型判断要不要委派时，直接在输入框敲斜杠命令：
+
+```text
+/chief 把设置页的保存按钮改成 loading 态，只动 src/settings.tsx，回报交付物/证据/遗留
+```
+
+`/chief` 会在 Host 侧直接启动名为 `chief` 的子智能体（也认显示名和唯一前缀），跳过模型回合，返回一条带子会话 id 的命令结果；子智能体跑完后把结果发回本会话。技能注入、模型路由、委派深度、工具清单都和 `delegate_agent` 走同一条路径。输入为空返回 `用法：/chief <任务>`；找不到该子智能体时列出可用的名字。
+
 ### 2. 新建技能
 
 在「技能」里点 **新建**：

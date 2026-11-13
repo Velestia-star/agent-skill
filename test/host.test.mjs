@@ -43,6 +43,7 @@ function makeHarness({ workspaces = [], sessions = [], liveAgents = [] } = {}) {
     warnings: [],
     activation: undefined,
     section: undefined,
+    commands: new Map(),
   }
 
   const services = {
@@ -78,6 +79,12 @@ function makeHarness({ workspaces = [], sessions = [], liveAgents = [] } = {}) {
           result: Promise.resolve({ stopReason: 'completed', output: [] }),
           dispose: async () => {},
         }
+      },
+    },
+    commands: {
+      register(definition) {
+        state.commands.set(definition.name, definition)
+        return () => state.commands.delete(definition.name)
       },
     },
     connection: {
@@ -517,6 +524,39 @@ test('a subagent answers to its display name and to a unique prefix', async () =
   await post(harness.state, ROUTES.agentDelete, { id: saved.json.agent.id })
   await post(harness.state, ROUTES.agentDelete, { id: devManager.json.agent.id })
   await post(harness.state, ROUTES.agentDelete, { id: devOps.json.agent.id })
+})
+
+test('the /chief command starts the chief subagent without a model turn', async () => {
+  const saved = await post(harness.state, ROUTES.agentSave, {
+    name: 'chief',
+    displayName: '幕僚长',
+  })
+  assert.equal(saved.status, 200)
+
+  const command = harness.state.commands.get('chief')
+  assert.ok(command, '/chief is registered')
+  const invoke = (rawInput) => ({
+    commandId: 'cmd-1',
+    agent: { id: 'parent-session' },
+    rawInput,
+    attachments: [],
+    signal: new AbortController().signal,
+  })
+
+  const started = await command.handler(invoke('把首页的保存按钮改成 loading 态'))
+  assert.equal(started.kind, 'success')
+  assert.match(started.text, /已交给 chief/)
+  assert.match(started.text, /子会话/)
+  assert.equal(harness.state.activation.provider, 'spawn')
+  assert.match(harness.state.activation.request.prompt[0].text, /把首页的保存按钮改成 loading 态/)
+
+  const empty = await command.handler(invoke('   '))
+  assert.deepEqual(empty, { kind: 'error', text: '用法：/chief <任务>' })
+
+  await post(harness.state, ROUTES.agentDelete, { id: saved.json.agent.id })
+  const missing = await command.handler(invoke('再做一次'))
+  assert.equal(missing.kind, 'error')
+  assert.match(missing.text, /没有名为 "chief" 的子智能体/)
 })
 
 test('deleting a skill removes the files this plugin wrote', async () => {
