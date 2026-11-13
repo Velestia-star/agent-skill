@@ -24,10 +24,10 @@ const ROUTES = {
   skill: '/api/dsh-agent-skill/skill',
   agentSave: '/api/dsh-agent-skill/agents/save',
   agentDelete: '/api/dsh-agent-skill/agents/delete',
-  agentReorder: '/api/dsh-agent-skill/agents/reorder',
+  agentArrange: '/api/dsh-agent-skill/agents/arrange',
   skillSave: '/api/dsh-agent-skill/skills/save',
   skillDelete: '/api/dsh-agent-skill/skills/delete',
-  skillReorder: '/api/dsh-agent-skill/skills/reorder',
+  skillArrange: '/api/dsh-agent-skill/skills/arrange',
 }
 
 /** Wait for the plugin's asynchronous startup pass. */
@@ -217,8 +217,82 @@ const post = (state, route, payload) =>
     body: JSON.stringify(payload),
   })
 
+const postEmpty = (state, route) =>
+  call(state, route, {
+    method: 'POST',
+    url: route,
+    headers: { 'content-type': 'application/json' },
+    body: undefined,
+  })
+
+/**
+ * One isolated store (and harness) per test. `boot()` starts a second harness
+ * against the same DSH_HOME, which is how the persistence tests prove the order
+ * survives a fresh process. Every temporary directory is removed in `t.after`.
+ */
+async function isolatedHarness(t, options = {}) {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'dsh-agent-skill-order-'))
+  const previous = process.env.DSH_HOME
+  const previousAgentsHome = process.env.DSH_AGENTS_HOME
+  const home = path.join(dir, 'dsh-home')
+  process.env.DSH_HOME = home
+  process.env.DSH_AGENTS_HOME = path.join(dir, 'agents-home')
+  const disposers = []
+
+  const boot = async (bootOptions = options) => {
+    const instance = makeHarness(bootOptions)
+    plugin.apply(instance.ctx)
+    await settle()
+    disposers.push(() => {
+      for (const dispose of instance.state.effects) {
+        try {
+          dispose()
+        } catch {
+          /* ignore */
+        }
+      }
+    })
+    return instance
+  }
+
+  const instance = await boot(options)
+  t.after(async () => {
+    for (const dispose of disposers.splice(0).reverse()) dispose()
+    if (previous === undefined) delete process.env.DSH_HOME
+    else process.env.DSH_HOME = previous
+    if (previousAgentsHome === undefined) delete process.env.DSH_AGENTS_HOME
+    else process.env.DSH_AGENTS_HOME = previousAgentsHome
+    await rm(dir, { recursive: true, force: true })
+  })
+  return { ...instance, boot, dir, home }
+}
+
+const agentIds = (state) => state.json.agents.map((agent) => agent.id)
+const agentNames = (state) => state.json.agents.map((agent) => agent.name)
+const skillNames = (state) => state.json.skills.map((skill) => skill.name)
+const agentsStoreFile = (box) => path.join(box.home, 'agent-skill', 'agents.json')
+const skillsStoreFile = (box) => path.join(box.home, 'agent-skill', 'skills.json')
+
+async function createAgent(box, name) {
+  const saved = await post(box.state, ROUTES.agentSave, { name })
+  assert.equal(saved.status, 200, `agent ${name} saved`)
+  return saved.json.agent
+}
+
+async function createSkill(box, name) {
+  const saved = await post(box.state, ROUTES.skillSave, {
+    name,
+    description: `${name} description.`,
+    content: `Body of ${name}.`,
+    scope: 'global',
+  })
+  assert.equal(saved.status, 200, `skill ${name} saved`)
+  return saved.json
+}
+
 let root
 let previousDshHome
+let previousAgentsHome
 let harness
 let workspaceA
 let workspaceB
@@ -226,7 +300,9 @@ let workspaceB
 before(async () => {
   root = await mkdtemp(path.join(os.tmpdir(), 'dsh-agent-skill-'))
   previousDshHome = process.env.DSH_HOME
+  previousAgentsHome = process.env.DSH_AGENTS_HOME
   process.env.DSH_HOME = path.join(root, 'dsh-home')
+  process.env.DSH_AGENTS_HOME = path.join(root, 'agents-home')
   workspaceA = path.join(root, 'workspace-a')
   workspaceB = path.join(root, 'workspace-b')
   await mkdir(workspaceA, { recursive: true })
@@ -255,6 +331,8 @@ after(async () => {
   }
   if (previousDshHome === undefined) delete process.env.DSH_HOME
   else process.env.DSH_HOME = previousDshHome
+  if (previousAgentsHome === undefined) delete process.env.DSH_AGENTS_HOME
+  else process.env.DSH_AGENTS_HOME = previousAgentsHome
   if (root) await rm(root, { recursive: true, force: true })
 })
 
@@ -784,91 +862,6 @@ test('delegation defers the depth policy to the host resolver', async () => {
   }
 })
 
-test('agents keep the order the user dragged them into', async () => {
-  const state = await call(harness.state, ROUTES.state)
-  const existingIds = state.json.agents.map((agent) => agent.id)
-  const created = []
-  for (const name of ['ord-a', 'ord-b', 'ord-c']) {
-    const saved = await post(harness.state, ROUTES.agentSave, { name })
-    assert.equal(saved.status, 200)
-    created.push(saved.json.agent.id)
-  }
-  const allIds = [...existingIds, ...created]
-  const reversed = [...allIds].reverse()
-  const reordered = await post(harness.state, ROUTES.agentReorder, { ids: reversed })
-  assert.equal(reordered.status, 200)
-  assert.deepEqual(reordered.json.agents.map((agent) => agent.id), reversed)
-  assert.deepEqual(reordered.json.agents.map((agent) => agent.order), reversed.map((_, index) => index))
-
-  const after = await call(harness.state, ROUTES.state)
-  assert.deepEqual(after.json.agents.map((agent) => agent.id), reversed)
-
-  const bad = await post(harness.state, ROUTES.agentReorder, { ids: [reversed[0]] })
-  assert.equal(bad.status, 400)
-  assert.equal(bad.json.error, 'invalid-order')
-
-  // A new card lands at the bottom of the current order.
-  const fourth = await post(harness.state, ROUTES.agentSave, { name: 'ord-d' })
-  assert.equal(fourth.status, 200)
-  const settled = await call(harness.state, ROUTES.state)
-  assert.equal(settled.json.agents[settled.json.agents.length - 1].name, 'ord-d')
-
-  for (const id of [...created, fourth.json.agent.id]) {
-    await post(harness.state, ROUTES.agentDelete, { id })
-  }
-})
-
-test('skills keep the order the user dragged them into', async () => {
-  const before = await call(harness.state, ROUTES.state)
-  assert.deepEqual(before.json.skills, [], 'this test starts from an empty skill list')
-  for (const name of ['ord-skill-a', 'ord-skill-b', 'ord-skill-c']) {
-    const saved = await post(harness.state, ROUTES.skillSave, {
-      name,
-      description: `${name}.`,
-      content: 'Body.',
-      scope: 'global',
-    })
-    assert.equal(saved.status, 200)
-  }
-
-  const reordered = await post(harness.state, ROUTES.skillReorder, {
-    names: ['ord-skill-c', 'ord-skill-a', 'ord-skill-b'],
-  })
-  assert.equal(reordered.status, 200)
-  assert.deepEqual(
-    reordered.json.skills.map((skill) => skill.name),
-    ['ord-skill-c', 'ord-skill-a', 'ord-skill-b'],
-  )
-
-  const after = await call(harness.state, ROUTES.state)
-  assert.deepEqual(
-    after.json.skills.map((skill) => skill.name),
-    ['ord-skill-c', 'ord-skill-a', 'ord-skill-b'],
-  )
-
-  // Renaming keeps the card where it sits.
-  await post(harness.state, ROUTES.skillSave, {
-    originalName: 'ord-skill-c',
-    name: 'ord-skill-cc',
-    description: 'Renamed.',
-    content: 'Body.',
-    scope: 'global',
-  })
-  const renamed = await call(harness.state, ROUTES.state)
-  assert.deepEqual(
-    renamed.json.skills.map((skill) => skill.name),
-    ['ord-skill-cc', 'ord-skill-a', 'ord-skill-b'],
-  )
-
-  const bad = await post(harness.state, ROUTES.skillReorder, { names: ['ord-skill-cc'] })
-  assert.equal(bad.status, 400)
-  assert.equal(bad.json.error, 'invalid-order')
-
-  for (const name of ['ord-skill-cc', 'ord-skill-a', 'ord-skill-b']) {
-    await post(harness.state, ROUTES.skillDelete, { name })
-  }
-})
-
 test('the route fence accepts a paired remote page through the connection service', async () => {
   const paired = await call(harness.state, ROUTES.state, {
     headers: {
@@ -929,4 +922,410 @@ test('reads a SKILL.md only inside a managed root', async () => {
   const read = await call(harness.state, `${ROUTES.skill}?path=${encodeURIComponent(file)}`)
   assert.equal(read.status, 200)
   assert.equal(read.json.content.trim(), 'Body.')
+})
+
+/* ------------------------------------------------------- arrangement tests */
+
+test('agent arrange persists a top-level rank that a second harness reloads', async (t) => {
+  const box = await isolatedHarness(t)
+  const a = await createAgent(box, 'agent-a')
+  const b = await createAgent(box, 'agent-b')
+  const c = await createAgent(box, 'agent-c')
+  const reversed = [c.id, b.id, a.id]
+
+  const arranged = await post(box.state, ROUTES.agentArrange, { ids: reversed })
+  assert.equal(arranged.status, 200)
+  assert.deepEqual(agentIds(arranged), reversed)
+
+  const after = await call(box.state, ROUTES.state)
+  assert.deepEqual(agentIds(after), reversed)
+
+  const stored = JSON.parse(await readFile(agentsStoreFile(box), 'utf8'))
+  assert.deepEqual(stored.rank, reversed)
+  assert.deepEqual(stored.agents.map((agent) => agent.id), reversed)
+  assert.ok(stored.agents.every((agent) => agent.order === undefined), 'no per-row order is written')
+
+  const second = await box.boot()
+  const reloaded = await call(second.state, ROUTES.state)
+  assert.deepEqual(agentIds(reloaded), reversed)
+})
+
+test('skill arrange persists a top-level rank that a second harness reloads', async (t) => {
+  const box = await isolatedHarness(t)
+  await createSkill(box, 'skill-a')
+  await createSkill(box, 'skill-b')
+  await createSkill(box, 'skill-c')
+  const reversed = ['skill-c', 'skill-a', 'skill-b']
+
+  const arranged = await post(box.state, ROUTES.skillArrange, { names: reversed })
+  assert.equal(arranged.status, 200)
+  assert.deepEqual(skillNames(arranged), reversed)
+
+  const after = await call(box.state, ROUTES.state)
+  assert.deepEqual(skillNames(after), reversed)
+
+  const stored = JSON.parse(await readFile(skillsStoreFile(box), 'utf8'))
+  assert.deepEqual(stored.rank, reversed)
+  assert.equal(stored.order, undefined, 'the old order map is not written')
+
+  const second = await box.boot()
+  const reloaded = await call(second.state, ROUTES.state)
+  assert.deepEqual(skillNames(reloaded), reversed)
+})
+
+test('agent arrange rejects every malformed permutation without writing', async (t) => {
+  const box = await isolatedHarness(t)
+  const a = await createAgent(box, 'agent-a')
+  await createAgent(box, 'agent-b')
+  await createSkill(box, 'cross-skill')
+  const baseline = agentIds(await call(box.state, ROUTES.state))
+  const beforeRaw = await readFile(agentsStoreFile(box), 'utf8')
+
+  const cases = [
+    ['missing body', undefined],
+    ['non-array', { ids: 'not-an-array' }],
+    ['missing item', { ids: [a.id] }],
+    ['duplicate id', { ids: [a.id, a.id] }],
+    ['unknown id', { ids: [a.id, 'ghost-agent'] }],
+    ['cross-list skill name', { ids: [a.id, 'cross-skill'] }],
+    ['non-string id', { ids: [a.id, 42] }],
+  ]
+  for (const [label, payload] of cases) {
+    const result =
+      payload === undefined ? await postEmpty(box.state, ROUTES.agentArrange) : await post(box.state, ROUTES.agentArrange, payload)
+    assert.equal(result.status, 400, label)
+    assert.equal(result.json.error, 'invalid-arrangement', label)
+    const current = await call(box.state, ROUTES.state)
+    assert.deepEqual(agentIds(current), baseline, `${label}: state order unchanged`)
+    assert.equal(await readFile(agentsStoreFile(box), 'utf8'), beforeRaw, `${label}: file unchanged`)
+  }
+
+  const method = await call(box.state, ROUTES.agentArrange)
+  assert.equal(method.status, 405)
+})
+
+test('skill arrange rejects every malformed permutation without writing', async (t) => {
+  const box = await isolatedHarness(t)
+  await createSkill(box, 'skill-a')
+  await createSkill(box, 'skill-b')
+  const agent = await createAgent(box, 'cross-agent')
+  const baseline = skillNames(await call(box.state, ROUTES.state))
+  const beforeRaw = await readFile(skillsStoreFile(box), 'utf8')
+
+  const cases = [
+    ['missing body', undefined],
+    ['non-array', { names: 'not-an-array' }],
+    ['missing item', { names: ['skill-a'] }],
+    ['duplicate name', { names: ['skill-a', 'skill-a'] }],
+    ['unknown name', { names: ['skill-a', 'ghost-skill'] }],
+    ['cross-list agent id', { names: ['skill-a', agent.id] }],
+    ['non-string name', { names: ['skill-a', 42] }],
+  ]
+  for (const [label, payload] of cases) {
+    const result =
+      payload === undefined ? await postEmpty(box.state, ROUTES.skillArrange) : await post(box.state, ROUTES.skillArrange, payload)
+    assert.equal(result.status, 400, label)
+    assert.equal(result.json.error, 'invalid-arrangement', label)
+    const current = await call(box.state, ROUTES.state)
+    assert.deepEqual(skillNames(current), baseline, `${label}: state order unchanged`)
+    assert.equal(await readFile(skillsStoreFile(box), 'utf8'), beforeRaw, `${label}: file unchanged`)
+  }
+
+  const method = await call(box.state, ROUTES.skillArrange)
+  assert.equal(method.status, 405)
+})
+
+test('renaming keeps the agent id and the skill rank position', async (t) => {
+  const box = await isolatedHarness(t)
+  const a = await createAgent(box, 'agent-a')
+  const b = await createAgent(box, 'agent-b')
+  const c = await createAgent(box, 'agent-c')
+  await post(box.state, ROUTES.agentArrange, { ids: [b.id, a.id, c.id] })
+
+  const renamedAgent = await post(box.state, ROUTES.agentSave, { id: b.id, name: 'agent-b-renamed' })
+  assert.equal(renamedAgent.status, 200)
+  assert.equal(renamedAgent.json.agent.id, b.id, 'agent id stays stable across a rename')
+  const agentsState = await call(box.state, ROUTES.state)
+  assert.deepEqual(agentNames(agentsState), ['agent-b-renamed', 'agent-a', 'agent-c'])
+  assert.deepEqual(agentIds(agentsState), [b.id, a.id, c.id])
+  const agentsStored = JSON.parse(await readFile(agentsStoreFile(box), 'utf8'))
+  assert.deepEqual(agentsStored.rank, [b.id, a.id, c.id])
+
+  await createSkill(box, 'skill-a')
+  await createSkill(box, 'skill-b')
+  await createSkill(box, 'skill-c')
+  await post(box.state, ROUTES.skillArrange, { names: ['skill-c', 'skill-a', 'skill-b'] })
+  const renamedSkill = await post(box.state, ROUTES.skillSave, {
+    originalName: 'skill-c',
+    name: 'skill-c-renamed',
+    description: 'Renamed.',
+    content: 'Body.',
+    scope: 'global',
+  })
+  assert.equal(renamedSkill.status, 200)
+  const skillsState = await call(box.state, ROUTES.state)
+  assert.deepEqual(skillNames(skillsState), ['skill-c-renamed', 'skill-a', 'skill-b'])
+  const skillsStored = JSON.parse(await readFile(skillsStoreFile(box), 'utf8'))
+  assert.deepEqual(skillsStored.rank, ['skill-c-renamed', 'skill-a', 'skill-b'])
+})
+
+test('deleting the middle item keeps the relative order of the rest', async (t) => {
+  const box = await isolatedHarness(t)
+  const a = await createAgent(box, 'agent-a')
+  const b = await createAgent(box, 'agent-b')
+  const c = await createAgent(box, 'agent-c')
+  await post(box.state, ROUTES.agentArrange, { ids: [b.id, a.id, c.id] })
+  await post(box.state, ROUTES.agentDelete, { id: a.id })
+  assert.deepEqual(agentIds(await call(box.state, ROUTES.state)), [b.id, c.id])
+  assert.deepEqual(
+    JSON.parse(await readFile(agentsStoreFile(box), 'utf8')).rank,
+    [b.id, c.id],
+  )
+
+  await createSkill(box, 'skill-a')
+  await createSkill(box, 'skill-b')
+  await createSkill(box, 'skill-c')
+  await post(box.state, ROUTES.skillArrange, { names: ['skill-c', 'skill-a', 'skill-b'] })
+  await post(box.state, ROUTES.skillDelete, { name: 'skill-a' })
+  assert.deepEqual(skillNames(await call(box.state, ROUTES.state)), ['skill-c', 'skill-b'])
+  assert.deepEqual(
+    JSON.parse(await readFile(skillsStoreFile(box), 'utf8')).rank,
+    ['skill-c', 'skill-b'],
+  )
+})
+
+test('new agents and skills land at the end and stay there after a restart', async (t) => {
+  const box = await isolatedHarness(t)
+  await createAgent(box, 'agent-a')
+  await createAgent(box, 'agent-b')
+  await createAgent(box, 'agent-c')
+  await post(box.state, ROUTES.agentArrange, { ids: agentIds(await call(box.state, ROUTES.state)).reverse() })
+  const d = await createAgent(box, 'agent-d')
+  assert.deepEqual(agentNames(await call(box.state, ROUTES.state)), ['agent-c', 'agent-b', 'agent-a', 'agent-d'])
+  assert.equal(
+    JSON.parse(await readFile(agentsStoreFile(box), 'utf8')).rank.slice(-1)[0],
+    d.id,
+  )
+
+  await createSkill(box, 'skill-a')
+  await createSkill(box, 'skill-b')
+  await createSkill(box, 'skill-c')
+  await post(box.state, ROUTES.skillArrange, { names: ['skill-c', 'skill-b', 'skill-a'] })
+  await createSkill(box, 'skill-d')
+  assert.deepEqual(skillNames(await call(box.state, ROUTES.state)), ['skill-c', 'skill-b', 'skill-a', 'skill-d'])
+  assert.equal(
+    JSON.parse(await readFile(skillsStoreFile(box), 'utf8')).rank.slice(-1)[0],
+    'skill-d',
+  )
+
+  const second = await box.boot()
+  const reloaded = await call(second.state, ROUTES.state)
+  assert.deepEqual(agentNames(reloaded), ['agent-c', 'agent-b', 'agent-a', 'agent-d'])
+  assert.deepEqual(skillNames(reloaded), ['skill-c', 'skill-b', 'skill-a', 'skill-d'])
+})
+
+test('invalid rank data falls back deterministically and legacy order is ignored', async (t) => {
+  const box = await isolatedHarness(t)
+  await mkdir(path.join(box.home, 'agent-skill'), { recursive: true })
+  const agentsWithRank = {
+    version: 1,
+    agents: [
+      { id: 'id-a', name: 'agent-a', order: 0 },
+      { id: 'id-b', name: 'agent-b', order: 1 },
+      { id: 'id-c', name: 'agent-c', order: 2 },
+    ],
+    // unknown key, duplicate key, non-string entries and a missing key: c wins
+    // first, b second, a is appended in its base (array) order. The per-row
+    // order is ignored.
+    rank: ['id-c', 42, null, 'ghost', 'id-c', 'id-b'],
+  }
+  await writeFile(agentsStoreFile(box), JSON.stringify(agentsWithRank, null, 2), 'utf8')
+  assert.deepEqual(agentNames(await call(box.state, ROUTES.state)), ['agent-c', 'agent-b', 'agent-a'])
+
+  await writeFile(
+    agentsStoreFile(box),
+    JSON.stringify(
+      {
+        version: 1,
+        agents: [
+          { id: 'id-a', name: 'agent-a', order: 2 },
+          { id: 'id-b', name: 'agent-b', order: 1 },
+          { id: 'id-c', name: 'agent-c', order: 0 },
+        ],
+        // A rank that is not an array falls back to the agents array order.
+        rank: 'not-an-array',
+      },
+      null,
+      2,
+    ),
+    'utf8',
+  )
+  assert.deepEqual(agentNames(await call(box.state, ROUTES.state)), ['agent-a', 'agent-b', 'agent-c'])
+
+  for (const name of ['z-skill', 'a-skill', 'm-skill']) {
+    const dir = path.join(box.home, 'skills', name)
+    await mkdir(dir, { recursive: true })
+    await writeFile(
+      path.join(dir, 'SKILL.md'),
+      `---\nname: ${name}\ndescription: ${name} description.\n---\nBody.\n`,
+      'utf8',
+    )
+  }
+  await writeFile(
+    skillsStoreFile(box),
+    JSON.stringify(
+      {
+        version: 1,
+        bindings: {},
+        // m first, a next, z is appended in base (alphabetical) order. The old
+        // order map would have produced z, m, a and must be ignored.
+        rank: ['m-skill', 7, 'm-skill', 'ghost', 'a-skill'],
+        order: { 'z-skill': 0, 'm-skill': 1, 'a-skill': 2 },
+      },
+      null,
+      2,
+    ),
+    'utf8',
+  )
+  assert.deepEqual(skillNames(await call(box.state, ROUTES.state)), ['m-skill', 'a-skill', 'z-skill'])
+
+  await writeFile(
+    skillsStoreFile(box),
+    JSON.stringify(
+      { version: 1, bindings: {}, rank: 'not-an-array', order: { 'z-skill': 0, 'm-skill': 1, 'a-skill': 2 } },
+      null,
+      2,
+    ),
+    'utf8',
+  )
+  assert.deepEqual(skillNames(await call(box.state, ROUTES.state)), ['a-skill', 'm-skill', 'z-skill'])
+})
+
+/* ------------------------------------------ rank upgrade from pre-rank stores */
+
+/**
+ * Skills created by an older release have bindings but no top-level `rank`:
+ * the old format kept a top-level `order` map instead. These tests boot such a
+ * store and then edit it, which is where the appending/renaming rules used to
+ * read the incomplete rank verbatim.
+ */
+async function legacySkillsStore(box, names) {
+  const file = skillsStoreFile(box)
+  const store = JSON.parse(await readFile(file, 'utf8'))
+  const order = Object.fromEntries(names.map((name, index) => [name, index]))
+  await writeFile(file, JSON.stringify({ version: 1, bindings: store.bindings, order }, null, 2), 'utf8')
+}
+
+async function writeSkillsRank(box, rank) {
+  const file = skillsStoreFile(box)
+  const store = JSON.parse(await readFile(file, 'utf8'))
+  await writeFile(file, JSON.stringify({ ...store, rank }, null, 2), 'utf8')
+}
+
+test('a legacy store without rank appends a new skill at the end', async (t) => {
+  const box = await isolatedHarness(t)
+  const names = ['skill-a', 'skill-b', 'skill-c']
+  for (const name of names) await createSkill(box, name)
+  await legacySkillsStore(box, names)
+  assert.deepEqual(skillNames(await call(box.state, ROUTES.state)), names)
+
+  await createSkill(box, 'skill-d')
+  assert.deepEqual(skillNames(await call(box.state, ROUTES.state)), [...names, 'skill-d'])
+  assert.deepEqual(
+    JSON.parse(await readFile(skillsStoreFile(box), 'utf8')).rank,
+    [...names, 'skill-d'],
+  )
+
+  const second = await box.boot()
+  assert.deepEqual(skillNames(await call(second.state, ROUTES.state)), [...names, 'skill-d'])
+})
+
+test('a legacy store without rank keeps a renamed skill in place', async (t) => {
+  const box = await isolatedHarness(t)
+  const names = ['skill-a', 'skill-b', 'skill-c']
+  for (const name of names) await createSkill(box, name)
+  await legacySkillsStore(box, names)
+  assert.deepEqual(skillNames(await call(box.state, ROUTES.state)), names)
+
+  const renamed = await post(box.state, ROUTES.skillSave, {
+    originalName: 'skill-c',
+    name: 'skill-cc',
+    description: 'Renamed.',
+    content: 'Body.',
+    scope: 'global',
+  })
+  assert.equal(renamed.status, 200)
+  assert.deepEqual(skillNames(await call(box.state, ROUTES.state)), ['skill-a', 'skill-b', 'skill-cc'])
+  assert.deepEqual(
+    JSON.parse(await readFile(skillsStoreFile(box), 'utf8')).rank,
+    ['skill-a', 'skill-b', 'skill-cc'],
+  )
+
+  const second = await box.boot()
+  assert.deepEqual(skillNames(await call(second.state, ROUTES.state)), ['skill-a', 'skill-b', 'skill-cc'])
+})
+
+test('a partial rank is completed before a new skill is appended', async (t) => {
+  const box = await isolatedHarness(t)
+  for (const name of ['skill-a', 'skill-b', 'skill-c']) await createSkill(box, name)
+  await writeSkillsRank(box, ['skill-b'])
+  assert.deepEqual(skillNames(await call(box.state, ROUTES.state)), ['skill-b', 'skill-a', 'skill-c'])
+
+  await createSkill(box, 'skill-d')
+  assert.deepEqual(
+    skillNames(await call(box.state, ROUTES.state)),
+    ['skill-b', 'skill-a', 'skill-c', 'skill-d'],
+  )
+  assert.deepEqual(
+    JSON.parse(await readFile(skillsStoreFile(box), 'utf8')).rank,
+    ['skill-b', 'skill-a', 'skill-c', 'skill-d'],
+  )
+
+  const second = await box.boot()
+  assert.deepEqual(
+    skillNames(await call(second.state, ROUTES.state)),
+    ['skill-b', 'skill-a', 'skill-c', 'skill-d'],
+  )
+})
+
+test('a partial rank is completed before a delete', async (t) => {
+  const box = await isolatedHarness(t)
+  for (const name of ['skill-a', 'skill-b', 'skill-c']) await createSkill(box, name)
+  await writeSkillsRank(box, ['skill-b'])
+  assert.deepEqual(skillNames(await call(box.state, ROUTES.state)), ['skill-b', 'skill-a', 'skill-c'])
+
+  const deleted = await post(box.state, ROUTES.skillDelete, { name: 'skill-c' })
+  assert.equal(deleted.status, 200)
+  assert.deepEqual(skillNames(await call(box.state, ROUTES.state)), ['skill-b', 'skill-a'])
+  assert.deepEqual(
+    JSON.parse(await readFile(skillsStoreFile(box), 'utf8')).rank,
+    ['skill-b', 'skill-a'],
+  )
+
+  const second = await box.boot()
+  assert.deepEqual(skillNames(await call(second.state, ROUTES.state)), ['skill-b', 'skill-a'])
+})
+
+test('a partial rank keeps a renamed skill in place', async (t) => {
+  const box = await isolatedHarness(t)
+  for (const name of ['skill-a', 'skill-b', 'skill-c']) await createSkill(box, name)
+  await writeSkillsRank(box, ['skill-b'])
+  assert.deepEqual(skillNames(await call(box.state, ROUTES.state)), ['skill-b', 'skill-a', 'skill-c'])
+
+  const renamed = await post(box.state, ROUTES.skillSave, {
+    originalName: 'skill-c',
+    name: 'skill-cc',
+    description: 'Renamed.',
+    content: 'Body.',
+    scope: 'global',
+  })
+  assert.equal(renamed.status, 200)
+  assert.deepEqual(skillNames(await call(box.state, ROUTES.state)), ['skill-b', 'skill-a', 'skill-cc'])
+  assert.deepEqual(
+    JSON.parse(await readFile(skillsStoreFile(box), 'utf8')).rank,
+    ['skill-b', 'skill-a', 'skill-cc'],
+  )
+
+  const second = await box.boot()
+  assert.deepEqual(skillNames(await call(second.state, ROUTES.state)), ['skill-b', 'skill-a', 'skill-cc'])
 })

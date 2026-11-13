@@ -9,7 +9,7 @@ The panel splits into two columns:
 - **Subagents (left)** — a named worker the model can delegate to: model route, reasoning effort, launch mode (`spawn` fresh conversation or `fork` inherited conversation), tool allowlist and attached skills.
 - **Skills (right)** — an ordinary `SKILL.md` instruction bundle with a description the model can trigger on: global, per workspace, or even per conversation.
 
-Both lists are drag-sortable: grab the six-dot handle on the left of a card, drag up or down, and a dashed gap opens between cards where the item will land. Drop to insert there; the order is written to the plugin store and survives a refresh or restart.
+Each column sorts independently: grab the six-dot handle on the left of a card, drag up or down, and a dashed slot opens between the other cards where the item will land. Release to insert it there. Dragging over the other column shows no slot and never changes that column. Moving the pointer out of the list removes the dashed slot and leaves no candidate position: releasing there writes nothing, while moving back inside resumes the same drag. Pressing `Esc`, a `pointercancel`, losing window focus or hiding the page cancels the whole drag and writes nothing. The handle is a real button, so clicking it never opens the card editor. The order is written to the plugin store and survives a refresh or restart.
 
 ## Requirements
 
@@ -92,11 +92,19 @@ In the subagent editor pick the skills under **Skills**. At delegation time the 
 
 | Data | Location |
 |---|---|
-| Subagent definitions | `<dshHome>/agent-skill/agents.json` (each row carries its drag `order`) |
-| Skill bindings | `<dshHome>/agent-skill/skills.json` (also holds the drag `order` map) |
+| Subagent definitions | `<dshHome>/agent-skill/agents.json` — `{ "version": 1, "agents": [...], "rank": [agentId, …] }`; `rank` is the top-level display order, and every write also reorders the `agents` array itself to match it |
+| Skill bindings | `<dshHome>/agent-skill/skills.json` — `{ "version": 1, "bindings": {…}, "rank": [skillName, …] }`; `rank` is the top-level display order |
 | Conversation-scoped skill bodies | `<dshHome>/agent-skill/managed-skills/<name>/SKILL.md` |
 | Global skills | `<dshHome>/skills/<name>/SKILL.md` (plus `<agentsHome>/skills`) |
 | Project skills | `<projectRoot>/.dsh/skills/<name>/SKILL.md` (nearest `.git` ancestor) |
+
+Order rules:
+
+- A newly created agent or skill is appended to the end of `rank`.
+- Renaming keeps the position: agents use a stable id that does not change on rename, and a skill rename replaces the old name with the new one in place inside `rank`.
+- Deleting removes the item from `rank`; every remaining item keeps its relative order.
+- If `rank` is missing or invalid (not an array, non-string entries, duplicates, unknown keys), the panel keeps the first occurrence of each valid key and appends every uncovered item in its base order — the `agents` array order for subagents, alphabetical (`localeCompare`) order for skills. The same normalization is applied on read and again before a save, delete or arrange writes the file, so a legacy file is rewritten as a complete order.
+- The old per-agent `order` field and the old top-level skill `order` map are ignored. They are not read for sorting and are not migrated; the next write drops them.
 
 Those skill roots are the ones `@deepseek-ai/dsh-skill-filesystem` scans for the global and project sources (its custom and bundled roots are left alone), so anything written here reaches agents without a second provider. The panel also lists skills created outside it.
 
@@ -111,10 +119,10 @@ All routes are fenced to loopback requests (or a paired device) with same-origin
 | `GET` | `/api/dsh-agent-skill/skill?path=` | Read one `SKILL.md` inside a managed root |
 | `POST` | `/api/dsh-agent-skill/agents/save` | Create or update a subagent |
 | `POST` | `/api/dsh-agent-skill/agents/delete` | Delete a subagent |
-| `POST` | `/api/dsh-agent-skill/agents/reorder` | Persist a drag order (`{ ids }`, a full permutation) |
+| `POST` | `/api/dsh-agent-skill/agents/arrange` | Persist the subagent order (`{ ids }`, a full permutation of the current agent ids; any other payload is `400 invalid-arrangement`, any other HTTP method is `405`) |
 | `POST` | `/api/dsh-agent-skill/skills/save` | Write a skill and its bindings |
 | `POST` | `/api/dsh-agent-skill/skills/delete` | Delete a skill and the files this plugin wrote for it |
-| `POST` | `/api/dsh-agent-skill/skills/reorder` | Persist a drag order (`{ names }`, a full permutation) |
+| `POST` | `/api/dsh-agent-skill/skills/arrange` | Persist the skill order (`{ names }`, a full permutation of the current skill names; any other payload is `400 invalid-arrangement`, any other HTTP method is `405`) |
 
 ## Model-facing tool
 

@@ -11,10 +11,10 @@ window.__ModuleLoader__.load({
     const API_MODEL = '/api/dsh-agent-skill/model'
     const API_AGENT_SAVE = '/api/dsh-agent-skill/agents/save'
     const API_AGENT_DELETE = '/api/dsh-agent-skill/agents/delete'
-    const API_AGENT_REORDER = '/api/dsh-agent-skill/agents/reorder'
+    const API_AGENT_ARRANGE = '/api/dsh-agent-skill/agents/arrange'
     const API_SKILL_SAVE = '/api/dsh-agent-skill/skills/save'
     const API_SKILL_DELETE = '/api/dsh-agent-skill/skills/delete'
-    const API_SKILL_REORDER = '/api/dsh-agent-skill/skills/reorder'
+    const API_SKILL_ARRANGE = '/api/dsh-agent-skill/skills/arrange'
 
     /* ------------------------------------------------------------ locale */
 
@@ -28,8 +28,8 @@ window.__ModuleLoader__.load({
       'panel.callhint': '调用方式',
       'panel.copyHint': '复制',
       'panel.copyTemplate': 'delegate_agent(agent: "<名称>", prompt: "…")',
-      'panel.dragHint': '拖动排序',
-      'panel.moving': '拖动中…',
+      'panel.sortHint': '拖动排序',
+      'panel.sortSlot': '放到这里',
       'panel.copied': '已复制',
       'panel.refresh': '刷新',
       'panel.loading': '正在读取…',
@@ -164,8 +164,8 @@ window.__ModuleLoader__.load({
       'error.when-to-use-too-long': '适用场景太长（上限 4000 字节）。',
       'error.workspace-unknown': '这个工作区不在注册表里，刷新后重选。',
       'error.invalid-delete-target': '删除目标不是技能文件。',
-      'error.invalid-order': '顺序数据不对，刷新后重试。',
-      'error.reorder-failed': '排序保存失败。',
+      'error.invalid-arrangement': '顺序数据不对，刷新后重试。',
+      'error.arrange-failed': '排序保存失败。',
       'toast.savedAgent': '子智能体已保存',
       'toast.deletedAgent': '子智能体已删除',
       'toast.savedSkill': '技能已保存',
@@ -182,8 +182,8 @@ window.__ModuleLoader__.load({
       'panel.callhint': 'Call',
       'panel.copyHint': 'Copy',
       'panel.copyTemplate': 'delegate_agent(agent: "<name>", prompt: "…")',
-      'panel.dragHint': 'Drag to reorder',
-      'panel.moving': 'Moving…',
+      'panel.sortHint': 'Drag to arrange',
+      'panel.sortSlot': 'Drop here',
       'panel.copied': 'Copied',
       'panel.refresh': 'Refresh',
       'panel.loading': 'Loading…',
@@ -318,8 +318,8 @@ window.__ModuleLoader__.load({
       'error.when-to-use-too-long': 'When to use is too long (4000 bytes max).',
       'error.workspace-unknown': 'That workspace is no longer registered; refresh and pick again.',
       'error.invalid-delete-target': 'The delete target is not a skill file.',
-      'error.invalid-order': 'The order payload was rejected; refresh and retry.',
-      'error.reorder-failed': 'Could not save the new order.',
+      'error.invalid-arrangement': 'The arrangement payload was rejected; refresh and retry.',
+      'error.arrange-failed': 'Could not save the new arrangement.',
       'toast.savedAgent': 'Subagent saved',
       'toast.deletedAgent': 'Subagent deleted',
       'toast.savedSkill': 'Skill saved',
@@ -467,7 +467,7 @@ window.__ModuleLoader__.load({
           h('path', { key: 'b', d: 'M8 8h7M8 12h7' }),
         ],
         dot: [h('circle', { key: 'a', cx: '12', cy: '12', r: '4', fill: 'currentColor', stroke: 'none' })],
-        grip: [
+        sortDots: [
           h('circle', { key: 'a', cx: '9', cy: '7', r: '1.2', fill: 'currentColor', stroke: 'none' }),
           h('circle', { key: 'b', cx: '15', cy: '7', r: '1.2', fill: 'currentColor', stroke: 'none' }),
           h('circle', { key: 'c', cx: '9', cy: '12', r: '1.2', fill: 'currentColor', stroke: 'none' }),
@@ -745,16 +745,7 @@ window.__ModuleLoader__.load({
         }
       }, [load])
 
-      const setData = useCallback((updater) => {
-        setState((previous) => {
-          if (!previous.data) return previous
-          const data = typeof updater === 'function' ? updater(previous.data) : updater
-          if (data === previous.data) return previous
-          return { ...previous, data }
-        })
-      }, [])
-
-      return { ...state, reload: load, setData }
+      return { ...state, reload: load }
     }
 
     function useModelEfforts(provider, model) {
@@ -1397,25 +1388,34 @@ window.__ModuleLoader__.load({
 
     /* ----------------------------------------------------------------- cards */
 
-    function DragGrip(props) {
+    function SortHandle(props) {
       return h(
-        'span',
+        'button',
         {
-          className: 'asa-grip',
-          draggable: true,
-          title: t('panel.dragHint'),
-          'aria-label': t('panel.dragHint'),
-          role: 'button',
-          tabIndex: -1,
-          onDragStart: props.onDragStart,
-          onDragEnd: props.onDragEnd,
+          type: 'button',
+          className: 'asa-sort-handle',
+          title: props.label,
+          'aria-label': props.label,
+          disabled: props.disabled === true,
+          draggable: false,
+          onDragStart: (event) => event.preventDefault(),
+          onPointerDown: (event) => {
+            event.preventDefault()
+            event.stopPropagation()
+            props.onPointerDown?.(event)
+          },
+          // A click on the handle must never open the card editor.
+          onClick: (event) => {
+            event.preventDefault()
+            event.stopPropagation()
+          },
         },
-        icon('grip', 12),
+        icon('sortDots', 12),
       )
     }
 
     function AgentCard(props) {
-      const { agent, data, onEdit, onDelete, confirm, onConfirm, onCancelConfirm, busy, drag } = props
+      const { agent, data, onEdit, onDelete, confirm, onConfirm, onCancelConfirm, busy, sortable } = props
       const skills = data.skills || []
       const chips = (agent.skills || []).map((name) => ({
         key: name,
@@ -1436,13 +1436,20 @@ window.__ModuleLoader__.load({
         'div',
         {
           className: 'asa-card',
-          'data-dnd-card': 'true',
-          'data-dragging': drag?.dragging ? 'true' : 'false',
+          'data-sort-card': 'true',
+          'data-sort-key': agent.id,
+          'data-sort-active': sortable?.active ? 'true' : 'false',
+          draggable: false,
+          onDragStart: (event) => event.preventDefault(),
         },
         h(
           'div',
           { className: 'asa-card-head' },
-          h(DragGrip, { onDragStart: drag?.onDragStart, onDragEnd: drag?.onDragEnd }),
+          h(SortHandle, {
+            label: t('panel.sortHint'),
+            disabled: sortable?.disabled === true,
+            onPointerDown: sortable?.onHandleDown,
+          }),
           h('span', { className: 'asa-card-title asa-mono' }, agent.name),
           agent.displayName && agent.displayName !== agent.name
             ? h('span', { className: 'asa-card-sub' }, agent.displayName)
@@ -1473,7 +1480,7 @@ window.__ModuleLoader__.load({
     }
 
     function SkillCard(props) {
-      const { skill, data, onEdit, onDelete, confirm, onConfirm, onCancelConfirm, busy, drag } = props
+      const { skill, data, onEdit, onDelete, confirm, onConfirm, onCancelConfirm, busy, sortable } = props
       const usedBy = (data.agents || []).filter((agent) => (agent.skills || []).includes(skill.name)).length
       const binding = skill.binding
       const scopeBadge =
@@ -1495,13 +1502,20 @@ window.__ModuleLoader__.load({
         'div',
         {
           className: 'asa-card',
-          'data-dnd-card': 'true',
-          'data-dragging': drag?.dragging ? 'true' : 'false',
+          'data-sort-card': 'true',
+          'data-sort-key': skill.name,
+          'data-sort-active': sortable?.active ? 'true' : 'false',
+          draggable: false,
+          onDragStart: (event) => event.preventDefault(),
         },
         h(
           'div',
           { className: 'asa-card-head' },
-          h(DragGrip, { onDragStart: drag?.onDragStart, onDragEnd: drag?.onDragEnd }),
+          h(SortHandle, {
+            label: t('panel.sortHint'),
+            disabled: sortable?.disabled === true,
+            onPointerDown: sortable?.onHandleDown,
+          }),
           h('span', { className: 'asa-card-title asa-mono' }, skill.name),
           h(Badge, { tone: skill.scope === 'global' ? undefined : 'brand' }, scopeBadge),
           h(Badge, null, skill.source === 'managed' ? t('skill.source.managed') : t('skill.source.filesystem')),
@@ -1626,33 +1640,64 @@ window.__ModuleLoader__.load({
       const [skillError, setSkillError] = useState(null)
       const [toast, setToast] = useState(null)
       const [confirm, setConfirm] = useState(null)
-      const [drag, setDrag] = useState(null)
       const toastTimer = useRef(0)
+      /**
+       * `setBusy` is async state: two writes started in the same tick both read
+       * `busy === false` and race. This ref is the synchronous mutex, and
+       * `mountedRef` keeps a late response from writing state into a gone page.
+       */
+      const writeLockRef = useRef(false)
+      const mountedRef = useRef(true)
 
       const showToast = useCallback((text) => {
+        if (!mountedRef.current) return
         try {
           window.clearTimeout(toastTimer.current)
         } catch {
           /* ignore */
         }
         setToast(text)
-        toastTimer.current = window.setTimeout(() => setToast(null), 2600)
+        toastTimer.current = window.setTimeout(() => {
+          if (mountedRef.current) setToast(null)
+        }, 2600)
       }, [])
 
-      useEffect(
-        () => () => {
+      useEffect(() => {
+        // StrictMode mounts, simulates an unmount and mounts again: the cleanup
+        // below must not leave every later state write looking unmounted.
+        mountedRef.current = true
+        return () => {
+          mountedRef.current = false
           try {
             window.clearTimeout(toastTimer.current)
           } catch {
             /* ignore */
           }
-        },
-        [],
-      )
+        }
+      }, [])
 
       const refresh = useCallback(async () => {
         await host.reload({ fresh: true })
       }, [host])
+
+      /**
+       * Serialises every write: arrange, save, delete. Returns `false` when a
+       * request is already in flight, so the second action is dropped instead of
+       * queueing behind it (the store has no per-field merge, and a stale answer
+       * must never overwrite a newer order).
+       */
+      const runExclusive = useCallback(async (task) => {
+        if (writeLockRef.current) return false
+        writeLockRef.current = true
+        setBusy(true)
+        try {
+          await task()
+        } finally {
+          writeLockRef.current = false
+          if (mountedRef.current) setBusy(false)
+        }
+        return true
+      }, [])
 
       const copyCallTemplate = useCallback(async () => {
         const template = t('panel.copyTemplate')
@@ -1666,157 +1711,383 @@ window.__ModuleLoader__.load({
         }
       }, [showToast])
 
-      /* ---------------------------------------------------------- drag & drop */
+      /* ------------------------------------------------------------ sorting */
 
-      const startDrag = useCallback((kind, key, event) => {
-        const card = event.currentTarget && event.currentTarget.closest
-          ? event.currentTarget.closest('[data-dnd-card]')
-          : null
-        const rect = card ? card.getBoundingClientRect() : null
-        try {
-          event.dataTransfer.effectAllowed = 'move'
-          event.dataTransfer.setData('text/plain', `${kind}:${key}`)
-          if (card && rect) {
-            event.dataTransfer.setDragImage(card, Math.min(28, Math.round(rect.width / 2)), 16)
-          }
-        } catch {
-          /* the state below still drives the gap preview */
+      const [sort, setSort] = useState(null)
+      const sortRef = useRef(null)
+      const listRefs = useRef({ agent: null, skill: null })
+      const dataRef = useRef(data)
+      dataRef.current = data
+      const hostRef = useRef(host)
+      hostRef.current = host
+      const autoScrollRef = useRef(0)
+      /** `{ node, pointerId, listener }` for the active pointer capture, if any. */
+      const captureRef = useRef(null)
+
+      const sortKeyOf = (kind) => (kind === 'agent' ? (item) => item.id : (item) => item.name)
+
+      /**
+       * The gap is computed against the *other* cards only, so the dragged card
+       * is never part of its own insertion decision:
+       * pointer above the i-th midpoint -> gap i, otherwise after the last card.
+       * `null` means the pointer is outside this column: no candidate, no drop.
+       */
+      const sortGap = (kind, clientX, clientY) => {
+        const list = listRefs.current[kind]
+        const current = sortRef.current
+        if (!list || current === null || current.kind !== kind) return null
+        const bounds = list.getBoundingClientRect()
+        if (
+          clientX < bounds.left ||
+          clientX > bounds.right ||
+          clientY < bounds.top ||
+          clientY > bounds.bottom
+        ) {
+          return null
         }
-        setDrag({ kind, key, height: rect ? Math.round(rect.height) : 74, over: null })
-      }, [])
+        const cards = list.querySelectorAll('[data-sort-card]')
+        let gap = 0
+        for (const card of cards) {
+          if (card.getAttribute('data-sort-key') === current.key) continue
+          const rect = card.getBoundingClientRect()
+          if (clientY < rect.top + rect.height / 2) return gap
+          gap += 1
+        }
+        return gap
+      }
 
-      const endDrag = useCallback(() => setDrag(null), [])
+      const applyGap = (clientX, clientY) => {
+        const current = sortRef.current
+        if (current === null || current.moved !== true) return
+        current.pointerX = clientX
+        current.pointerY = clientY
+        const gap = sortGap(current.kind, clientX, clientY)
+        current.gap = gap
+        setSort((previous) =>
+          previous === null || previous.gap === gap ? previous : { ...previous, gap },
+        )
+      }
 
-      const dragOver = useCallback((kind, event) => {
-        if (drag === null || drag.kind !== kind) return
-        event.preventDefault()
+      const stopAutoScroll = () => {
+        if (autoScrollRef.current !== 0) {
+          try {
+            window.cancelAnimationFrame(autoScrollRef.current)
+          } catch {
+            /* ignore */
+          }
+          autoScrollRef.current = 0
+        }
+      }
+
+      const stepAutoScroll = () => {
+        autoScrollRef.current = 0
+        const current = sortRef.current
+        if (current === null) return
+        const list = listRefs.current[current.kind]
+        if (!list) return
+        const bounds = list.getBoundingClientRect()
+        if (
+          current.pointerX < bounds.left ||
+          current.pointerX > bounds.right ||
+          current.pointerY < bounds.top ||
+          current.pointerY > bounds.bottom
+        ) {
+          return
+        }
+        let direction = 0
+        if (current.pointerY - bounds.top < 32) direction = -1
+        else if (bounds.bottom - current.pointerY < 32) direction = 1
+        if (direction === 0) return
+        const before = list.scrollTop
+        list.scrollTop += direction * 12
+        if (list.scrollTop === before) return
+        // Coordinates go stale while the container scrolls: recompute from the
+        // last pointer position so the gap follows the content, not the viewport.
+        applyGap(current.pointerX, current.pointerY)
+        autoScrollRef.current = window.requestAnimationFrame(stepAutoScroll)
+      }
+
+      const scheduleAutoScroll = () => {
+        if (autoScrollRef.current !== 0) return
+        autoScrollRef.current = window.requestAnimationFrame(stepAutoScroll)
+      }
+
+      /**
+       * Capture is taken on the scroll container, never on the handle: the handle
+       * is re-created whenever `sortableNodes` swaps the dragged card for a slot,
+       * so a capture bound to it would be dropped mid-gesture. A refused capture
+       * is not fatal — the window listeners still track the pointer.
+       */
+      const capturePointer = (kind, pointerId) => {
+        const node = listRefs.current[kind]
+        if (!node || typeof pointerId !== 'number') return
+        if (typeof node.setPointerCapture !== 'function') return
+        const listener = (event) => {
+          const current = sortRef.current
+          if (current === null) return
+          if (current.pointerId !== event.pointerId) return
+          // The browser dropped the capture (pointer removed, element detached):
+          // the gesture is over, and it must not write.
+          finishSort(false)
+        }
         try {
-          event.dataTransfer.dropEffect = 'move'
+          node.setPointerCapture(pointerId)
+        } catch {
+          return
+        }
+        captureRef.current = { node, pointerId, listener }
+        try {
+          // `lostpointercapture` does not bubble: it has to sit on the element
+          // that owns the capture.
+          node.addEventListener('lostpointercapture', listener, { once: true })
         } catch {
           /* ignore */
         }
-        const container = event.currentTarget
-        const cards = Array.from(container.querySelectorAll('[data-dnd-card]')).filter(
-          (node) => node.getAttribute('data-dragging') !== 'true',
-        )
-        let over = cards.length
-        for (let index = 0; index < cards.length; index += 1) {
-          const rect = cards[index].getBoundingClientRect()
-          if (event.clientY < rect.top + rect.height / 2) {
-            over = index
-            break
-          }
+      }
+
+      const releaseCapture = () => {
+        const capture = captureRef.current
+        captureRef.current = null
+        if (capture === null) return
+        try {
+          capture.node.removeEventListener('lostpointercapture', capture.listener)
+        } catch {
+          /* ignore */
         }
-        // Edge autoscroll keeps long lists usable while dragging.
-        const bounds = container.getBoundingClientRect()
-        if (event.clientY - bounds.top < 44) container.scrollTop -= 14
-        else if (bounds.bottom - event.clientY < 44) container.scrollTop += 14
-        setDrag((previous) =>
-          previous === null || previous.over === over ? previous : { ...previous, over },
-        )
-      }, [drag])
+        try {
+          capture.node.releasePointerCapture(capture.pointerId)
+        } catch {
+          /* ignore */
+        }
+      }
 
-      const dragLeave = useCallback((event) => {
-        if (event.currentTarget && event.currentTarget.contains(event.relatedTarget)) return
-        setDrag((previous) => (previous === null ? previous : { ...previous, over: null }))
-      }, [])
-
-      const dropOn = useCallback(async (kind, event) => {
-        if (drag === null || drag.kind !== kind) return
-        event.preventDefault()
-        const over = drag.over
-        const key = drag.key
-        setDrag(null)
-        if (over === null || over === undefined || !data) return
-
-        const items = kind === 'agent' ? data.agents || [] : data.skills || []
-        const keyOf = kind === 'agent' ? (item) => item.id : (item) => item.name
+      async function commitSort(kind, key, gap) {
+        const snapshot = dataRef.current
+        if (!snapshot) return
+        const items = kind === 'agent' ? snapshot.agents || [] : snapshot.skills || []
+        const keyOf = sortKeyOf(kind)
         const from = items.findIndex((item) => keyOf(item) === key)
         if (from < 0) return
-        const rest = items.filter((item, index) => index !== from)
-        const insert = Math.max(0, Math.min(over, rest.length))
-        const next = [...rest.slice(0, insert), items[from], ...rest.slice(insert)]
-        if (next.every((item, index) => item === items[index])) return
-
-        host.setData(
-          kind === 'agent'
-            ? (previous) => (previous ? { ...previous, agents: next } : previous)
-            : (previous) => (previous ? { ...previous, skills: next } : previous),
-        )
-
-        try {
-          if (kind === 'agent') {
-            const response = await postJson(API_AGENT_REORDER, {
-              ids: next.map((item) => item.id),
-            })
-            if (Array.isArray(response.agents)) {
-              host.setData((previous) => (previous ? { ...previous, agents: response.agents } : previous))
+        const dragged = items[from]
+        const others = items.filter((item, index) => index !== from)
+        const insert = Math.max(0, Math.min(gap, others.length))
+        const ordered = [...others.slice(0, insert), dragged, ...others.slice(insert)]
+        if (ordered.every((item, index) => item === items[index])) return
+        // The lock covers the write *and* the re-read: nothing else can start in
+        // between, so the list is never shown against a superseded order.
+        await runExclusive(async () => {
+          try {
+            // No optimistic update: the Host is the source of truth and the list
+            // is re-read from it after the write.
+            if (kind === 'agent') {
+              await postJson(API_AGENT_ARRANGE, { ids: ordered.map((item) => item.id) })
+            } else {
+              await postJson(API_SKILL_ARRANGE, { names: ordered.map((item) => item.name) })
             }
-          } else {
-            const response = await postJson(API_SKILL_REORDER, {
-              names: next.map((item) => item.name),
-            })
-            if (Array.isArray(response.skills)) {
-              host.setData((previous) => (previous ? { ...previous, skills: response.skills } : previous))
-            }
+            await hostRef.current.reload()
+          } catch (error) {
+            if (mountedRef.current) showToast(describeError(error))
+            await hostRef.current.reload()
           }
-        } catch (error) {
-          showToast(describeError(error))
-          await host.reload()
-        }
-      }, [data, drag, host, showToast])
+        })
+      }
 
-      const sortableItems = (kind, items, keyOf, renderItem) => {
-        const active = drag !== null && drag.kind === kind ? drag : null
+      /**
+       * Ends the gesture. The candidate is cleared before the capture is
+       * released, so the `lostpointercapture` that release triggers is already a
+       * no-op and can never re-enter this function.
+       */
+      const finishSort = (commit) => {
+        const current = sortRef.current
+        stopAutoScroll()
+        sortRef.current = null
+        releaseCapture()
+        setSort(null)
+        if (current === null || commit !== true) return
+        if (current.gap === null || current.gap === undefined) return
+        void commitSort(current.kind, current.key, current.gap)
+      }
+
+      const beginSort = (kind, key, event) => {
+        if (sortRef.current !== null) return
+        // A write owns the store right now: a drag started here would read a list
+        // that the pending re-read is about to replace.
+        if (writeLockRef.current) return
+        if (event.button !== undefined && event.button !== 0) return
+        // A second finger is not the gesture: only the primary pointer drags.
+        if (event.isPrimary === false) return
+        const card = event.currentTarget?.closest?.('[data-sort-card]')
+        if (!card) return
+        event.preventDefault()
+        event.stopPropagation()
+        const rect = card.getBoundingClientRect()
+        const height = Math.max(24, Math.round(rect.height))
+        sortRef.current = {
+          kind,
+          key,
+          height,
+          gap: null,
+          moved: false,
+          pointerId: event.pointerId,
+          pointerType: typeof event.pointerType === 'string' ? event.pointerType : 'mouse',
+          startX: event.clientX,
+          startY: event.clientY,
+          pointerX: event.clientX,
+          pointerY: event.clientY,
+        }
+        capturePointer(kind, event.pointerId)
+      }
+
+      useEffect(() => {
+        const onPointerMove = (event) => {
+          const current = sortRef.current
+          if (current === null) return
+          // Only the gesture's own pointer steers the candidate: a second finger
+          // must not move the slot, and must not be prevented either.
+          if (event.pointerId !== current.pointerId) return
+          // A mouse released outside the window never delivers its pointerup and
+          // comes back with no pressed button. End the drag instead of leaving a
+          // candidate that would commit on the next unrelated click.
+          if (current.pointerType !== 'touch' && (event.buttons & 1) === 0) {
+            finishSort(false)
+            return
+          }
+          if (current.moved !== true) {
+            // A click on the handle must not change the arrangement: require a real
+            // pointer movement before the candidate becomes active.
+            if (
+              Math.abs(event.clientX - current.startX) < 4 &&
+              Math.abs(event.clientY - current.startY) < 4
+            ) {
+              return
+            }
+            current.moved = true
+            setSort({ kind: current.kind, key: current.key, height: current.height, gap: null })
+          }
+          event.preventDefault()
+          applyGap(event.clientX, event.clientY)
+          scheduleAutoScroll()
+        }
+        const onPointerUp = (event) => {
+          const current = sortRef.current
+          if (current === null) return
+          if (event.pointerId !== current.pointerId) return
+          // A right/middle button release is not the end of a left-button drag.
+          if (event.button !== undefined && event.button !== 0) return
+          if (current.moved !== true) {
+            finishSort(false)
+            return
+          }
+          applyGap(event.clientX, event.clientY)
+          finishSort(true)
+        }
+        const onPointerCancel = (event) => {
+          const current = sortRef.current
+          if (current === null) return
+          if (event.pointerId !== current.pointerId) return
+          finishSort(false)
+        }
+        const onKeyDown = (event) => {
+          if (event.key !== 'Escape') return
+          if (sortRef.current === null) return
+          // The drag owns this Escape; it must not also reach the Harness.
+          event.preventDefault()
+          finishSort(false)
+        }
+        const onBlur = () => finishSort(false)
+        const onVisibilityChange = () => {
+          if (document.visibilityState === 'hidden') finishSort(false)
+        }
+        // A context menu would swallow the rest of the pointer sequence. Outside
+        // a drag the browser menu stays untouched.
+        const onContextMenu = (event) => {
+          if (sortRef.current === null) return
+          event.preventDefault()
+        }
+        window.addEventListener('pointermove', onPointerMove, { passive: false })
+        window.addEventListener('pointerup', onPointerUp)
+        window.addEventListener('pointercancel', onPointerCancel)
+        window.addEventListener('keydown', onKeyDown)
+        window.addEventListener('blur', onBlur)
+        window.addEventListener('contextmenu', onContextMenu)
+        document.addEventListener('visibilitychange', onVisibilityChange)
+        return () => {
+          window.removeEventListener('pointermove', onPointerMove)
+          window.removeEventListener('pointerup', onPointerUp)
+          window.removeEventListener('pointercancel', onPointerCancel)
+          window.removeEventListener('keydown', onKeyDown)
+          window.removeEventListener('blur', onBlur)
+          window.removeEventListener('contextmenu', onContextMenu)
+          document.removeEventListener('visibilitychange', onVisibilityChange)
+          stopAutoScroll()
+          // The panel can be removed mid-drag: drop the candidate and give the
+          // capture back instead of leaving it on an unmounted tree.
+          sortRef.current = null
+          releaseCapture()
+        }
+      }, [])
+
+      const sortableNodes = (kind, items, renderCard) => {
+        const current = sort !== null && sort.kind === kind ? sort : null
+        if (current === null) return items.map((item) => renderCard(item, false))
+        const keyOf = sortKeyOf(kind)
+        const others = items.filter((item) => keyOf(item) !== current.key)
+        if (others.length === 0) {
+          // Nothing to reorder against: a single card cannot move, so keep it on
+          // screen instead of replacing it with a lone empty slot.
+          return items.map((item) => renderCard(item, false))
+        }
+        if (current.gap === null) {
+          // Outside the list: cancel the candidate but keep the original card
+          // visible (dimmed) so the list does not jump.
+          return items.map((item) => renderCard(item, keyOf(item) === current.key))
+        }
+        const slot = (slotKey) =>
+          h('div', {
+            key: slotKey,
+            className: 'asa-sort-slot',
+            style: { height: `${current.height}px` },
+            title: t('panel.sortSlot'),
+            'aria-label': t('panel.sortSlot'),
+          })
+        const gap = Math.max(0, Math.min(current.gap, others.length))
         const nodes = []
-        let seen = 0
-        for (const item of items) {
-          const key = keyOf(item)
-          const isActive = active !== null && key === active.key
-          if (!isActive && active !== null && active.over === seen) {
-            nodes.push(
-              h('div', {
-                key: `gap-${kind}-${seen}`,
-                className: 'asa-drop-gap',
-                style: { height: `${active.height}px` },
-                'aria-hidden': 'true',
-              }),
-            )
-          }
-          if (!isActive) seen += 1
-          nodes.push(renderItem(item, { dragging: isActive }))
+        for (let index = 0; index < others.length; index += 1) {
+          if (index === gap) nodes.push(slot(`sort-slot-${kind}`))
+          nodes.push(renderCard(others[index], false))
         }
-        if (active !== null && active.over === seen) {
-          nodes.push(
-            h('div', {
-              key: `gap-${kind}-end`,
-              className: 'asa-drop-gap',
-              style: { height: `${active.height}px` },
-              'aria-hidden': 'true',
-            }),
-          )
-        }
+        if (gap === others.length) nodes.push(slot(`sort-slot-${kind}-end`))
         return nodes
+      }
+
+      const onListScroll = (kind) => () => {
+        const current = sortRef.current
+        if (current === null || current.kind !== kind) return
+        applyGap(current.pointerX, current.pointerY)
       }
 
       const saveAgent = useCallback(async () => {
         if (!agentEditor) return
-        setBusy(true)
+        // A save started mid-drag would write a definition against an order the
+        // drag is still changing: ignore it and let the gesture settle first.
+        if (sortRef.current !== null) return
         setAgentError(null)
-        try {
-          await postJson(API_AGENT_SAVE, agentEditor.draft)
-          setAgentEditor(null)
-          showToast(t('toast.savedAgent'))
-          await host.reload()
-        } catch (error) {
-          setAgentError(describeError(error))
-        } finally {
-          setBusy(false)
-        }
-      }, [agentEditor, host, showToast])
+        await runExclusive(async () => {
+          try {
+            await postJson(API_AGENT_SAVE, agentEditor.draft)
+            if (!mountedRef.current) return
+            setAgentEditor(null)
+            showToast(t('toast.savedAgent'))
+            await host.reload()
+          } catch (error) {
+            if (mountedRef.current) setAgentError(describeError(error))
+          }
+        })
+      }, [agentEditor, host, runExclusive, showToast])
 
       const saveSkill = useCallback(async () => {
         if (!skillEditor) return
+        if (sortRef.current !== null) return
         const draft = skillEditor.draft
         const payload = {
           originalName: draft.originalName,
@@ -1849,47 +2120,49 @@ window.__ModuleLoader__.load({
             return
           }
         }
-        setBusy(true)
         setSkillError(null)
-        try {
-          await postJson(API_SKILL_SAVE, payload)
-          setSkillEditor(null)
-          showToast(t('toast.savedSkill'))
-          await host.reload()
-        } catch (error) {
-          setSkillError(describeError(error))
-        } finally {
-          setBusy(false)
-        }
-      }, [host, showToast, skillEditor])
+        await runExclusive(async () => {
+          try {
+            await postJson(API_SKILL_SAVE, payload)
+            if (!mountedRef.current) return
+            setSkillEditor(null)
+            showToast(t('toast.savedSkill'))
+            await host.reload()
+          } catch (error) {
+            if (mountedRef.current) setSkillError(describeError(error))
+          }
+        })
+      }, [host, runExclusive, showToast, skillEditor])
 
       const deleteAgent = useCallback(async (agent) => {
-        setBusy(true)
-        try {
-          await postJson(API_AGENT_DELETE, { id: agent.id })
-          setConfirm(null)
-          showToast(t('toast.deletedAgent'))
-          await host.reload()
-        } catch (error) {
-          showToast(describeError(error))
-        } finally {
-          setBusy(false)
-        }
-      }, [host, showToast])
+        if (sortRef.current !== null) return
+        await runExclusive(async () => {
+          try {
+            await postJson(API_AGENT_DELETE, { id: agent.id })
+            if (!mountedRef.current) return
+            setConfirm(null)
+            showToast(t('toast.deletedAgent'))
+            await host.reload()
+          } catch (error) {
+            if (mountedRef.current) showToast(describeError(error))
+          }
+        })
+      }, [host, runExclusive, showToast])
 
       const deleteSkill = useCallback(async (skill) => {
-        setBusy(true)
-        try {
-          await postJson(API_SKILL_DELETE, { name: skill.name, path: skill.path })
-          setConfirm(null)
-          showToast(t('toast.deletedSkill'))
-          await host.reload()
-        } catch (error) {
-          showToast(describeError(error))
-        } finally {
-          setBusy(false)
-        }
-      }, [host, showToast])
+        if (sortRef.current !== null) return
+        await runExclusive(async () => {
+          try {
+            await postJson(API_SKILL_DELETE, { name: skill.name, path: skill.path })
+            if (!mountedRef.current) return
+            setConfirm(null)
+            showToast(t('toast.deletedSkill'))
+            await host.reload()
+          } catch (error) {
+            if (mountedRef.current) showToast(describeError(error))
+          }
+        })
+      }, [host, runExclusive, showToast])
 
       const header = h(
         'header',
@@ -1972,6 +2245,7 @@ window.__ModuleLoader__.load({
               hint: t('panel.agents.hint'),
               count: agents.length,
               onNew: () => {
+                if (sortRef.current !== null) return
                 setAgentError(null)
                 setSkillEditor(null)
                 setAgentEditor({ draft: emptyAgentDraft(), isNew: true })
@@ -1994,11 +2268,10 @@ window.__ModuleLoader__.load({
                   'div',
                   {
                     className: 'asa-list',
-                    onDragOver: (event) => dragOver('agent', event),
-                    onDragLeave: dragLeave,
-                    onDrop: (event) => {
-                      void dropOn('agent', event)
+                    ref: (node) => {
+                      listRefs.current.agent = node
                     },
+                    onScroll: onListScroll('agent'),
                   },
                   agents.length === 0
                     ? h(
@@ -2010,10 +2283,13 @@ window.__ModuleLoader__.load({
                           tone: 'primary',
                           iconName: 'plus',
                           label: t('action.new'),
-                          onClick: () => setAgentEditor({ draft: emptyAgentDraft(), isNew: true }),
+                          onClick: () => {
+                            if (sortRef.current !== null) return
+                            setAgentEditor({ draft: emptyAgentDraft(), isNew: true })
+                          },
                         }),
                       )
-                    : sortableItems('agent', agents, (agent) => agent.id, (agent, view) =>
+                    : sortableNodes('agent', agents, (agent, active) =>
                         h(AgentCard, {
                           key: agent.id,
                           agent,
@@ -2021,16 +2297,20 @@ window.__ModuleLoader__.load({
                           busy,
                           confirm: confirm?.kind === 'agent' && confirm.id === agent.id,
                           onEdit: () => {
+                            if (sortRef.current !== null) return
                             setAgentError(null)
                             setAgentEditor({ draft: agentDraftOf(agent), isNew: false })
                           },
-                          onDelete: () => setConfirm({ kind: 'agent', id: agent.id }),
+                          onDelete: () => {
+                            if (sortRef.current !== null) return
+                            setConfirm({ kind: 'agent', id: agent.id })
+                          },
                           onConfirm: () => deleteAgent(agent),
                           onCancelConfirm: () => setConfirm(null),
-                          drag: {
-                            dragging: view.dragging,
-                            onDragStart: (event) => startDrag('agent', agent.id, event),
-                            onDragEnd: endDrag,
+                          sortable: {
+                            active,
+                            disabled: busy,
+                            onHandleDown: (event) => beginSort('agent', agent.id, event),
                           },
                         }),
                       ),
@@ -2043,6 +2323,7 @@ window.__ModuleLoader__.load({
               hint: t('panel.skills.hint'),
               count: skills.length,
               onNew: () => {
+                if (sortRef.current !== null) return
                 setSkillError(null)
                 setAgentEditor(null)
                 setSkillEditor({ draft: skillDraftOf(undefined, data.workspaces || []), isNew: true })
@@ -2065,11 +2346,10 @@ window.__ModuleLoader__.load({
                   'div',
                   {
                     className: 'asa-list',
-                    onDragOver: (event) => dragOver('skill', event),
-                    onDragLeave: dragLeave,
-                    onDrop: (event) => {
-                      void dropOn('skill', event)
+                    ref: (node) => {
+                      listRefs.current.skill = node
                     },
+                    onScroll: onListScroll('skill'),
                   },
                   skills.length === 0
                     ? h(
@@ -2081,11 +2361,13 @@ window.__ModuleLoader__.load({
                           tone: 'primary',
                           iconName: 'plus',
                           label: t('action.new'),
-                          onClick: () =>
-                            setSkillEditor({ draft: skillDraftOf(undefined, data.workspaces || []), isNew: true }),
+                          onClick: () => {
+                            if (sortRef.current !== null) return
+                            setSkillEditor({ draft: skillDraftOf(undefined, data.workspaces || []), isNew: true })
+                          },
                         }),
                       )
-                    : sortableItems('skill', skills, (skill) => skill.name, (skill, view) =>
+                    : sortableNodes('skill', skills, (skill, active) =>
                         h(SkillCard, {
                           key: skill.path || skill.name,
                           skill,
@@ -2093,16 +2375,20 @@ window.__ModuleLoader__.load({
                           busy,
                           confirm: confirm?.kind === 'skill' && confirm.name === skill.name,
                           onEdit: () => {
+                            if (sortRef.current !== null) return
                             setSkillError(null)
                             setSkillEditor({ draft: skillDraftOf(skill, data.workspaces || []), isNew: false })
                           },
-                          onDelete: () => setConfirm({ kind: 'skill', name: skill.name }),
+                          onDelete: () => {
+                            if (sortRef.current !== null) return
+                            setConfirm({ kind: 'skill', name: skill.name })
+                          },
                           onConfirm: () => deleteSkill(skill),
                           onCancelConfirm: () => setConfirm(null),
-                          drag: {
-                            dragging: view.dragging,
-                            onDragStart: (event) => startDrag('skill', skill.name, event),
-                            onDragEnd: endDrag,
+                          sortable: {
+                            active,
+                            disabled: busy,
+                            onHandleDown: (event) => beginSort('skill', skill.name, event),
                           },
                         }),
                       ),
@@ -2202,15 +2488,18 @@ window.__ModuleLoader__.load({
 .asa-card { display:flex; flex-direction:column; gap:6px; padding:10px 11px; border-radius:10px;
   border:1px solid var(--dsw-alias-border-l1,#e4e4ea); background:var(--dsw-alias-bg-base,#fff); }
 .asa-card:hover { border-color:var(--dsw-alias-border-l2,#c9c9d2); }
-.asa-grip { display:inline-flex; align-items:center; justify-content:center; width:16px; height:20px; margin-left:-5px;
-  flex:none; border-radius:5px; color:var(--dsw-alias-label-secondary,#6b6b76); cursor:grab; opacity:.6; }
-.asa-grip:hover { opacity:1; background:var(--dsw-alias-bg-layer-2,#ececf1); }
-.asa-grip:active { cursor:grabbing; }
-.asa-card[data-dragging="true"] { max-height:34px; min-height:34px; overflow:hidden; opacity:.55;
-  border-style:dashed; padding:5px 11px; }
-.asa-card[data-dragging="true"] > * { pointer-events:none; }
-.asa-drop-gap { flex:none; border:1px dashed var(--dsw-alias-brand-primary,#3b6ef5); border-radius:10px;
-  background:var(--dsw-alias-bg-layer-2,#ececf1); opacity:.75; }
+.asa-sort-handle { display:inline-flex; align-items:center; justify-content:center; width:18px; height:22px;
+  margin-left:-6px; flex:none; padding:0; border:none; background:none; border-radius:5px;
+  color:var(--dsw-alias-label-secondary); cursor:grab; opacity:.6; touch-action:none; }
+.asa-sort-handle:hover { opacity:1; background:var(--dsw-alias-bg-layer-2); }
+.asa-sort-handle:active { cursor:grabbing; }
+.asa-sort-handle:focus-visible { outline:2px solid var(--dsw-alias-brand-primary); outline-offset:1px; }
+.asa-sort-handle:disabled { cursor:default; opacity:.35; }
+.asa-sort-handle:disabled:hover { background:none; }
+.asa-sort-slot { flex:none; border:1px dashed var(--dsw-alias-brand-primary); border-radius:10px;
+  background:var(--dsw-alias-bg-layer-2); opacity:.7; }
+.asa-card[data-sort-active="true"] { opacity:.45; border-style:dashed; }
+.asa-card[data-sort-active="true"] > * { pointer-events:none; }
 .asa-card-head { display:flex; align-items:center; gap:6px; min-width:0; }
 .asa-card-title { font-size:13px; font-weight:600; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 .asa-card-sub { font-size:11.5px; color:var(--dsw-alias-label-secondary,#6b6b76); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }

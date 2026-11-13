@@ -30,8 +30,10 @@
  *   GET  /api/dsh-agent-skill/skill?path=<absolute SKILL.md>
  *   POST /api/dsh-agent-skill/agents/save
  *   POST /api/dsh-agent-skill/agents/delete
+ *   POST /api/dsh-agent-skill/agents/arrange
  *   POST /api/dsh-agent-skill/skills/save
  *   POST /api/dsh-agent-skill/skills/delete
+ *   POST /api/dsh-agent-skill/skills/arrange
  */
 
 import { existsSync, promises as fs } from 'node:fs'
@@ -47,10 +49,10 @@ const MODEL_ROUTE = `${ROUTE_BASE}/model`
 const SKILL_ROUTE = `${ROUTE_BASE}/skill`
 const AGENT_SAVE_ROUTE = `${ROUTE_BASE}/agents/save`
 const AGENT_DELETE_ROUTE = `${ROUTE_BASE}/agents/delete`
-const AGENT_REORDER_ROUTE = `${ROUTE_BASE}/agents/reorder`
+const AGENT_ARRANGE_ROUTE = `${ROUTE_BASE}/agents/arrange`
 const SKILL_SAVE_ROUTE = `${ROUTE_BASE}/skills/save`
 const SKILL_DELETE_ROUTE = `${ROUTE_BASE}/skills/delete`
-const SKILL_REORDER_ROUTE = `${ROUTE_BASE}/skills/reorder`
+const SKILL_ARRANGE_ROUTE = `${ROUTE_BASE}/skills/arrange`
 
 const TOOL_NAME = 'delegate_agent'
 const SECTION_NAME = `${PLUGIN_ID}/session-skills`
@@ -543,7 +545,6 @@ function normalizeAgent(raw, existing) {
     model: model === '' ? undefined : model,
     reasoningEffort: reasoningEffort === '' ? undefined : reasoningEffort,
     maxDepth,
-    order: Number.isFinite(raw?.order) ? raw.order : existing?.order,
     tools: normalizeToolList(toolsSource),
     skills: Array.isArray(raw?.skills ?? existing?.skills)
       ? [
@@ -590,48 +591,140 @@ async function quarantineCorrupt(file, error) {
   }
 }
 
+/* ---------------------------------------------------------------- ordering */
+
+/**
+ * Turn a stored `rank` into a deterministic full order for `keys`.
+ *
+ * Only string keys that exist in `keys` survive, and only their first
+ * occurrence is kept. Every key the stored rank does not cover is appended in
+ * the base order supplied by the caller. This is the only normalization step:
+ * both stores persist the result, and `collectSkills`/`readAgentStore` apply it
+ * again on read so an edit made outside the panel cannot break ordering.
+ */
+function normalizeRank(rank, keys) {
+  const known = new Set(keys)
+  const ordered = []
+  const seen = new Set()
+  for (const value of Array.isArray(rank) ? rank : []) {
+    if (typeof value !== 'string' || value === '') continue
+    if (!known.has(value) || seen.has(value)) continue
+    seen.add(value)
+    ordered.push(value)
+  }
+  for (const key of keys) {
+    if (seen.has(key)) continue
+    seen.add(key)
+    ordered.push(key)
+  }
+  return ordered
+}
+
+/** Apply a stored `rank` to `items`, preserving the caller's base order for
+ * everything the rank does not mention. */
+function applyRank(items, rank, keyOf) {
+  const byKey = new Map()
+  for (const item of items) byKey.set(keyOf(item), item)
+  const ordered = []
+  for (const key of normalizeRank(rank, items.map(keyOf))) {
+    const item = byKey.get(key)
+    if (item !== undefined) ordered.push(item)
+  }
+  return ordered
+}
+
+/** Normalize an existing rank for a set of keys (used when writing). */
+function rankOf(rank, keys) {
+  return normalizeRank(rank, keys)
+}
+
+/** Append `key` to the end of a rank unless it is already present. */
+function appendRankKey(rank, key) {
+  const list = Array.isArray(rank)
+    ? rank.filter((value) => typeof value === 'string' && value !== '')
+    : []
+  return list.includes(key) ? list : [...list, key]
+}
+
+/** Replace `from` with `to` in place, keeping every other entry where it was. */
+function replaceRankKey(rank, from, to) {
+  const list = Array.isArray(rank)
+    ? rank.filter((value) => typeof value === 'string' && value !== '')
+    : []
+  const at = list.indexOf(from)
+  if (at >= 0) {
+    list[at] = to
+    return [...new Set(list)]
+  }
+  return appendRankKey(list, to)
+}
+
+/** Drop `key` from a rank; the other entries keep their relative order. */
+function dropRankKey(rank, key) {
+  return (Array.isArray(rank) ? rank : []).filter(
+    (value) => typeof value === 'string' && value !== '' && value !== key,
+  )
+}
+
 async function readAgentStore() {
   let text
   try {
     text = await fs.readFile(agentsFile(), 'utf8')
   } catch {
-    return []
+    return { agents: [], rank: [] }
   }
   try {
     const parsed = JSON.parse(text.replace(/^\uFEFF/, ''))
     const list = Array.isArray(parsed?.agents) ? parsed.agents : []
-    const rank = (agent) => (Number.isFinite(agent.order) ? agent.order : Number.MAX_SAFE_INTEGER)
-    return list
-      .filter((agent) => agent && typeof agent.name === 'string' && agent.name !== '')
-      .map((agent) => ({
-        ...agent,
-        skills: Array.isArray(agent.skills) ? agent.skills : [],
-        tools: Array.isArray(agent.tools) && agent.tools.length > 0 ? agent.tools : null,
-        mode: agent.mode === 'fork' ? 'fork' : 'spawn',
-        maxDepth: Number.isFinite(agent.maxDepth) ? agent.maxDepth : 1,
-      }))
-      .sort((a, b) => rank(a) - rank(b))
+    const agents = list
+      .filter(
+        (agent) =>
+          agent &&
+          typeof agent.name === 'string' &&
+          agent.name !== '' &&
+          typeof agent.id === 'string' &&
+          agent.id !== '',
+      )
+      .map((agent) => {
+        // `order` was the old per-row position. It is ignored and must not be
+        // carried into the rewritten store.
+        const clean = { ...agent }
+        delete clean.order
+        return {
+          ...clean,
+          skills: Array.isArray(clean.skills) ? clean.skills : [],
+          tools: Array.isArray(clean.tools) && clean.tools.length > 0 ? clean.tools : null,
+          mode: clean.mode === 'fork' ? 'fork' : 'spawn',
+          maxDepth: Number.isFinite(clean.maxDepth) ? clean.maxDepth : 1,
+        }
+      })
+    const ordered = applyRank(agents, parsed?.rank, (agent) => agent.id)
+    return { agents: ordered, rank: ordered.map((agent) => agent.id) }
   } catch (error) {
     await quarantineCorrupt(agentsFile(), error)
-    return []
+    return { agents: [], rank: [] }
   }
 }
 
-async function writeAgentStore(agents) {
+async function writeAgentStore(agents, rank) {
+  const orderedRank = rankOf(rank, agents.map((agent) => agent.id))
+  const byId = new Map(agents.map((agent) => [agent.id, agent]))
+  const orderedAgents = orderedRank.map((id) => byId.get(id)).filter((agent) => agent !== undefined)
   await serializeWrite(async () => {
     const file = agentsFile()
     await fs.mkdir(path.dirname(file), { recursive: true })
-    const payload = JSON.stringify({ version: 1, agents }, null, 2)
+    const payload = JSON.stringify({ version: 1, agents: orderedAgents, rank: orderedRank }, null, 2)
     const temporary = `${file}.${process.pid}.tmp`
     await fs.writeFile(temporary, payload, 'utf8')
     await fs.rename(temporary, file)
   })
+  return orderedAgents
 }
 
 /* ---------------------------------------------------------- skill bindings */
 
 function emptyBindings() {
-  return { version: 1, bindings: {}, order: {} }
+  return { version: 1, bindings: {}, rank: [] }
 }
 
 async function readBindings() {
@@ -645,11 +738,11 @@ async function readBindings() {
     const parsed = JSON.parse(text.replace(/^\uFEFF/, ''))
     const bindings = parsed?.bindings
     if (bindings === null || typeof bindings !== 'object' || Array.isArray(bindings)) return emptyBindings()
-    const order =
-      parsed?.order !== null && typeof parsed?.order === 'object' && !Array.isArray(parsed.order)
-        ? parsed.order
-        : {}
-    return { version: 1, bindings, order }
+    // The old top-level `order` map is deliberately not read.
+    const rank = Array.isArray(parsed?.rank)
+      ? parsed.rank.filter((value) => typeof value === 'string' && value !== '')
+      : []
+    return { version: 1, bindings, rank }
   } catch (error) {
     await quarantineCorrupt(bindingsFile(), error)
     return emptyBindings()
@@ -657,10 +750,20 @@ async function readBindings() {
 }
 
 async function writeBindings(state) {
+  const payload = JSON.stringify(
+    {
+      version: 1,
+      bindings: state?.bindings ?? {},
+      rank: Array.isArray(state?.rank)
+        ? [...new Set(state.rank.filter((value) => typeof value === 'string'))]
+        : [],
+    },
+    null,
+    2,
+  )
   await serializeWrite(async () => {
     const file = bindingsFile()
     await fs.mkdir(path.dirname(file), { recursive: true })
-    const payload = JSON.stringify(state, null, 2)
     const temporary = `${file}.${process.pid}.tmp`
     await fs.writeFile(temporary, payload, 'utf8')
     await fs.rename(temporary, file)
@@ -683,7 +786,6 @@ async function collectSkills(ctx) {
   const { roots, projectRoots } = allSkillRoots(ctx)
   const state = await readBindings()
   const bindings = state.bindings
-  const order = state.order ?? {}
   const byName = new Map()
 
   const absorb = (skill) => {
@@ -732,13 +834,10 @@ async function collectSkills(ctx) {
     })
   }
 
-  const rank = (name) => (Number.isFinite(order[name]) ? order[name] : Number.MAX_SAFE_INTEGER)
-  return [...byName.values()].sort((a, b) => {
-    const left = rank(a.name)
-    const right = rank(b.name)
-    if (left !== right) return left - right
-    return a.name.localeCompare(b.name)
-  })
+  // Base order is deterministic (name, localeCompare) and only then overridden
+  // by the stored rank; everything the rank misses stays in base order.
+  const base = [...byName.values()].sort((a, b) => a.name.localeCompare(b.name))
+  return applyRank(base, state.rank, (skill) => skill.name)
 }
 
 function presentBinding(binding) {
@@ -1095,12 +1194,13 @@ export function apply(ctx) {
       const url = requestUrl(request)
       const fresh = url?.searchParams.get('fresh') === '1'
       const workspaces = listWorkspaces(ctx)
-      const [agents, skills, models, sessions] = await Promise.all([
+      const [agentStore, skills, models, sessions] = await Promise.all([
         readAgentStore(),
         collectSkills(ctx),
         collectModels(ctx, { fresh }),
         listSessions(ctx, workspaces, { fresh }),
       ])
+      const agents = agentStore.agents
       currentAgents = agents
       sendJson(request, response, 200, {
         version: 1,
@@ -1197,7 +1297,8 @@ export function apply(ctx) {
     }
     try {
       const result = await withMutation(async () => {
-        const agents = await readAgentStore()
+        const store = await readAgentStore()
+        const agents = store.agents
         const targetId = typeof body.id === 'string' ? body.id : undefined
         const existingIndex = targetId ? agents.findIndex((agent) => agent.id === targetId) : -1
         const existing = existingIndex >= 0 ? agents[existingIndex] : undefined
@@ -1208,8 +1309,10 @@ export function apply(ctx) {
         if (clash) throw httpError(409, 'agent-name-taken')
         if (existingIndex >= 0) agents[existingIndex] = next
         else agents.push(next)
-        await writeAgentStore(agents)
-        return { agent: next, agents }
+        // New definitions land at the end of the current rank; an edit keeps the
+        // stable id, so its position never moves.
+        const ordered = await writeAgentStore(agents, appendRankKey(store.rank, next.id))
+        return { agent: next, agents: ordered }
       })
       currentAgents = result.agents
       syncDelegateTool()
@@ -1220,38 +1323,41 @@ export function apply(ctx) {
     }
   }
 
-  const handleReorderAgents = async (request, response) => {
+  const handleArrangeAgents = async (request, response) => {
     if (!methodAllowed(request, response, ['POST'])) return
     let body
     try {
       body = await readJsonBody(request)
-    } catch (error) {
-      sendJson(request, response, 400, { error: error instanceof Error ? error.message : 'invalid-json' })
+    } catch {
+      sendJson(request, response, 400, { error: 'invalid-arrangement' })
       return
     }
     try {
-      const ids = Array.isArray(body.ids) ? body.ids.map(String) : []
+      const ids = body?.ids
+      if (!Array.isArray(ids) || ids.some((id) => typeof id !== 'string')) {
+        throw httpError(400, 'invalid-arrangement')
+      }
       const ordered = await withMutation(async () => {
-        const agents = await readAgentStore()
-        if (ids.length !== agents.length) throw httpError(400, 'invalid-order')
-        const known = new Map(agents.map((agent) => [agent.id, agent]))
+        const agents = (await readAgentStore()).agents
+        if (ids.length !== agents.length) throw httpError(400, 'invalid-arrangement')
+        const byId = new Map(agents.map((agent) => [agent.id, agent]))
         const seen = new Set()
         const next = []
         for (const id of ids) {
-          if (seen.has(id) || !known.has(id)) throw httpError(400, 'invalid-order')
+          if (seen.has(id) || !byId.has(id)) throw httpError(400, 'invalid-arrangement')
           seen.add(id)
-          const agent = known.get(id)
-          next.push({ ...agent, order: next.length })
+          next.push(byId.get(id))
         }
-        await writeAgentStore(next)
-        return next
+        return writeAgentStore(next, next.map((agent) => agent.id))
       })
       currentAgents = ordered
       syncDelegateTool()
       sendJson(request, response, 200, { agents: ordered })
     } catch (error) {
-      const status = Number(error?.status) || 500
-      sendJson(request, response, status, { error: error instanceof Error ? error.message : 'reorder-failed' })
+      const status = Number(error?.status) === 400 ? 400 : 500
+      sendJson(request, response, status, {
+        error: status === 400 ? 'invalid-arrangement' : 'arrange-failed',
+      })
     }
   }
 
@@ -1271,9 +1377,9 @@ export function apply(ctx) {
     }
     try {
       const agents = await withMutation(async () => {
-        const next = (await readAgentStore()).filter((agent) => agent.id !== id)
-        await writeAgentStore(next)
-        return next
+        const store = await readAgentStore()
+        const next = store.agents.filter((agent) => agent.id !== id)
+        return writeAgentStore(next, dropRankKey(store.rank, id))
       })
       currentAgents = agents
       syncDelegateTool()
@@ -1348,10 +1454,18 @@ export function apply(ctx) {
       const result = await withMutation(async () => {
         const state = await readBindings()
         const previous = originalName !== '' ? state.bindings[originalName] : state.bindings[name]
+        // Snapshot the skills that exist before this save writes anything. A
+        // pre-rank store (bindings + legacy `order`) returns rank=[] here, so
+        // normalizing against this set is what keeps an append at the end and a
+        // rename in place instead of promoting them to the front on read.
+        const currentSkills = await collectSkills(ctx)
+        const currentNames = currentSkills
+          .map((skill) => skill.name)
+          .sort((left, right) => left.localeCompare(right))
         if (originalName !== name) {
           const taken =
             state.bindings[name] !== undefined ||
-            (await collectSkills(ctx)).some((skill) => skill.name === name)
+            currentSkills.some((skill) => skill.name === name)
           if (taken) throw httpError(409, 'duplicate-skill')
         }
 
@@ -1404,11 +1518,17 @@ export function apply(ctx) {
           (file) => !files.some((next) => canonicalKey(next) === canonicalKey(file)),
         )
         await removeFiles(stale)
+        // Persist the rank in normalized form for the current skill set before
+        // the append/replace below, so an upgraded store stops carrying a rank
+        // that covers only some of the skills.
+        state.rank = normalizeRank(state.rank, currentNames)
         if (originalName !== '' && originalName !== name) {
           delete state.bindings[originalName]
-          // Renaming keeps the card where the user dragged it.
-          if (Number.isFinite(state.order[originalName])) state.order[name] = state.order[originalName]
-          delete state.order[originalName]
+          // A skill is keyed by name; a rename swaps the name in place so the
+          // card keeps its position instead of an array index being persisted.
+          state.rank = replaceRankKey(state.rank, originalName, name)
+        } else {
+          state.rank = appendRankKey(state.rank, name)
         }
         state.bindings[name] = {
           scope,
@@ -1447,6 +1567,11 @@ export function apply(ctx) {
       const removed = await withMutation(async () => {
         const state = await readBindings()
         const binding = name !== '' ? state.bindings[name] : undefined
+        // Resolve the current full set before touching anything so the rank is
+        // written back complete and the deleted name is removed from it.
+        const currentNames = (await collectSkills(ctx))
+          .map((skill) => skill.name)
+          .sort((left, right) => left.localeCompare(right))
         const targets = new Set()
         // Only the file the user actually confirmed is a candidate from the
         // request; same-named skills in other roots stay untouched.
@@ -1458,7 +1583,7 @@ export function apply(ctx) {
         for (const file of binding?.files ?? []) targets.add(file)
         if (name !== '') {
           delete state.bindings[name]
-          delete state.order[name]
+          state.rank = dropRankKey(normalizeRank(state.rank, currentNames), name)
           await writeBindings(state)
         }
         await removeFiles([...targets])
@@ -1474,37 +1599,40 @@ export function apply(ctx) {
     }
   }
 
-  const handleReorderSkills = async (request, response) => {
+  const handleArrangeSkills = async (request, response) => {
     if (!methodAllowed(request, response, ['POST'])) return
     let body
     try {
       body = await readJsonBody(request)
-    } catch (error) {
-      sendJson(request, response, 400, { error: error instanceof Error ? error.message : 'invalid-json' })
+    } catch {
+      sendJson(request, response, 400, { error: 'invalid-arrangement' })
       return
     }
     try {
-      const names = Array.isArray(body.names) ? body.names.map((value) => normalizeSkillName(value)) : []
-      const order = await withMutation(async () => {
+      const names = body?.names
+      if (!Array.isArray(names) || names.some((name) => typeof name !== 'string')) {
+        throw httpError(400, 'invalid-arrangement')
+      }
+      const skills = await withMutation(async () => {
         const state = await readBindings()
         const current = (await collectSkills(ctx)).map((skill) => skill.name)
-        if (names.length !== current.length) throw httpError(400, 'invalid-order')
+        if (names.length !== current.length) throw httpError(400, 'invalid-arrangement')
         const known = new Set(current)
         const seen = new Set()
-        const next = {}
         for (const name of names) {
-          if (seen.has(name) || !known.has(name)) throw httpError(400, 'invalid-order')
+          if (seen.has(name) || !known.has(name)) throw httpError(400, 'invalid-arrangement')
           seen.add(name)
-          next[name] = Object.keys(next).length
         }
-        state.order = next
+        state.rank = names.slice()
         await writeBindings(state)
-        return next
+        return collectSkills(ctx)
       })
-      sendJson(request, response, 200, { order, skills: await collectSkills(ctx) })
+      sendJson(request, response, 200, { skills })
     } catch (error) {
-      const status = Number(error?.status) || 500
-      sendJson(request, response, status, { error: error instanceof Error ? error.message : 'reorder-failed' })
+      const status = Number(error?.status) === 400 ? 400 : 500
+      sendJson(request, response, status, {
+        error: status === 400 ? 'invalid-arrangement' : 'arrange-failed',
+      })
     }
   }
 
@@ -1535,10 +1663,10 @@ export function apply(ctx) {
         webServer.register({ kind: 'exact', path: SKILL_ROUTE, handler: fenced(handleReadSkill) }),
         webServer.register({ kind: 'exact', path: AGENT_SAVE_ROUTE, handler: fenced(handleSaveAgent) }),
         webServer.register({ kind: 'exact', path: AGENT_DELETE_ROUTE, handler: fenced(handleDeleteAgent) }),
-        webServer.register({ kind: 'exact', path: AGENT_REORDER_ROUTE, handler: fenced(handleReorderAgents) }),
+        webServer.register({ kind: 'exact', path: AGENT_ARRANGE_ROUTE, handler: fenced(handleArrangeAgents) }),
         webServer.register({ kind: 'exact', path: SKILL_SAVE_ROUTE, handler: fenced(handleSaveSkill) }),
         webServer.register({ kind: 'exact', path: SKILL_DELETE_ROUTE, handler: fenced(handleDeleteSkill) }),
-        webServer.register({ kind: 'exact', path: SKILL_REORDER_ROUTE, handler: fenced(handleReorderSkills) }),
+        webServer.register({ kind: 'exact', path: SKILL_ARRANGE_ROUTE, handler: fenced(handleArrangeSkills) }),
       ]
       return () => {
         for (const dispose of disposers.splice(0)) {
@@ -1699,7 +1827,7 @@ export function apply(ctx) {
     const parent = exec?.agent
     if (parent === undefined) throw new Error('delegate_agent 需要一个调用方 agent')
 
-    const agents = currentAgents.length > 0 ? currentAgents : await readAgentStore()
+    const agents = currentAgents.length > 0 ? currentAgents : (await readAgentStore()).agents
     const wanted = String(args?.agent ?? '').trim()
     const needle = wanted.toLowerCase()
     const lowerName = (agent) => String(agent.name ?? '').toLowerCase()
@@ -1964,7 +2092,7 @@ export function apply(ctx) {
   /* -------------------------------------------------------------- startup */
 
   void (async () => {
-    currentAgents = await readAgentStore()
+    currentAgents = (await readAgentStore()).agents
     await loadChildRules()
     resyncChildRestrictions()
     try {

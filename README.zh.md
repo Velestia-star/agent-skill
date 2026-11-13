@@ -9,7 +9,7 @@ DeepSeek Harness 的侧栏插件：自己造**子智能体**和**技能**，然�
 - **子智能体（左）**——一个模型可以派人干活的具名工人：模型服务、思考强度、启动方式（`spawn` 全新对话 / `fork` 继承父对话）、工具清单、绑定的技能。
 - **技能（右）**——一份普通的 `SKILL.md` 指令包，带一段模型用来判断触发的描述：可以放全局、按工作区，甚至按单个对话生效。
 
-两个列表都能拖动排序：抓住卡片左侧的六点手柄，上下拖动时卡片之间会撑开一个虚线空位，松手就插到那里；顺序写进插件存储，刷新或重启后保持。
+两栏各自独立排序：抓住卡片左侧的六点手柄上下拖动，其余卡片之间会撑开一个虚线空位，松手就插到那里。拖到另一栏不会出现空位，也不会改动那一栏。指针移出列表时虚线空位消失、不留候选位：在列表外松手不会写盘，移回列表内则继续同一次拖动。按 `Esc`、触发 pointercancel、窗口失焦或页面不可见都会取消整次拖动且不写盘。手柄是真正的按钮，点它不会打开卡片编辑。顺序写进插件存储，刷新或重启后保持。
 
 ## 依赖
 
@@ -92,11 +92,19 @@ dsh plugin install /absolute/path/to/dsh-agent-skill
 
 | 数据 | 位置 |
 |---|---|
-| 子智能体定义 | `<dshHome>/agent-skill/agents.json`（每行带拖拽用的 `order`） |
-| 技能绑定 | `<dshHome>/agent-skill/skills.json`（同时保存拖拽 `order` 映射） |
+| 子智能体定义 | `<dshHome>/agent-skill/agents.json` —— `{ "version": 1, "agents": [...], "rank": [agentId, …] }`，`rank` 是顶层展示顺序，每次写盘时 `agents` 数组本身也会按这个顺序重排 |
+| 技能绑定 | `<dshHome>/agent-skill/skills.json` —— `{ "version": 1, "bindings": {…}, "rank": [技能名, …] }`，`rank` 是顶层展示顺序 |
 | 按对话生效的技能正文 | `<dshHome>/agent-skill/managed-skills/<技能名>/SKILL.md` |
 | 全局技能 | `<dshHome>/skills/<技能名>/SKILL.md`（以及 `<agentsHome>/skills`） |
 | 项目技能 | `<项目根>/.dsh/skills/<技能名>/SKILL.md`（最近的 `.git` 祖先） |
+
+排序规则：
+
+- 新建的子智能体/技能追加到 `rank` 末尾。
+- 改名保持原位：子智能体用不随改名变化的稳定 id；技能改名时在 `rank` 里把旧名原位替换成新名。
+- 删除时从 `rank` 移除该项，其余项的相对顺序不变。
+- `rank` 缺失或非法（不是数组、含非字符串、重复、未知 key）时，保留每个有效 key 的首次出现，未覆盖的项按基础顺序补到末尾——子智能体用 `agents` 数组顺序，技能用名字的 `localeCompare` 字母序。读取时应用同一套归一化，保存、删除或排序写盘前再应用一次，旧文件会被重写成完整顺序。
+- 旧的逐行 `order` 字段和旧顶层技能 `order` 映射一律忽略：不参与排序、不做迁移；下次写盘时会消失。
 
 这些根目录是 `@deepseek-ai/dsh-skill-filesystem` 扫描全局与项目来源时用的位置（它自己的 custom / bundled 根不在管理范围内），所以写在这里的技能不需要第二个 provider 就能进模型目录。面板也会列出插件之外创建的技能。
 
@@ -111,10 +119,10 @@ dsh plugin install /absolute/path/to/dsh-agent-skill
 | `GET` | `/api/dsh-agent-skill/skill?path=` | 读取托管根目录内的一份 `SKILL.md` |
 | `POST` | `/api/dsh-agent-skill/agents/save` | 新建或更新子智能体 |
 | `POST` | `/api/dsh-agent-skill/agents/delete` | 删除子智能体 |
-| `POST` | `/api/dsh-agent-skill/agents/reorder` | 保存拖拽顺序（`{ ids }`，完整排列） |
+| `POST` | `/api/dsh-agent-skill/agents/arrange` | 保存子智能体顺序（`{ ids }`，当前全部 agent id 的一个完整排列；载荷不合法返回 `400 invalid-arrangement`，其他 HTTP 方法返回 `405`） |
 | `POST` | `/api/dsh-agent-skill/skills/save` | 写入技能及其绑定 |
 | `POST` | `/api/dsh-agent-skill/skills/delete` | 删除技能与插件为它写过的文件 |
-| `POST` | `/api/dsh-agent-skill/skills/reorder` | 保存拖拽顺序（`{ names }`，完整排列） |
+| `POST` | `/api/dsh-agent-skill/skills/arrange` | 保存技能顺序（`{ names }`，当前全部技能名的一个完整排列；载荷不合法返回 `400 invalid-arrangement`，其他 HTTP 方法返回 `405`） |
 
 ## 模型侧工具
 
