@@ -718,6 +718,18 @@ test('the route fence accepts a paired remote page through the connection servic
   assert.equal(anonymous.status, 403)
 })
 
+test('deleting a flat external skill removes exactly that file', async () => {
+  const flat = path.join(root, 'dsh-home', 'skills', 'flat-skill.md')
+  await mkdir(path.dirname(flat), { recursive: true })
+  await writeFile(flat, '---\nname: flat-skill\ndescription: Flat.\n---\nBody.\n', 'utf8')
+  const state = await call(harness.state, ROUTES.state)
+  const skill = state.json.skills.find((entry) => entry.name === 'flat-skill')
+  assert.equal(skill.path, flat)
+  const deleted = await post(harness.state, ROUTES.skillDelete, { name: 'flat-skill', path: flat })
+  assert.equal(deleted.status, 200)
+  await assert.rejects(stat(flat))
+})
+
 test('the route fence rejects cross-origin and foreign-host requests', async () => {
   const crossOrigin = await call(harness.state, ROUTES.state, {
     headers: { origin: 'https://evil.example' },

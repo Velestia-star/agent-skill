@@ -1242,14 +1242,15 @@ export function apply(ctx) {
   const removeFiles = async (files) => {
     for (const file of files ?? []) {
       const resolved = path.resolve(file)
-      // Defense in depth: only skill documents inside a managed skill root may be
-      // removed, never the plugin's own stores or bundle resources.
-      if (!isSkillFileTarget(resolved, '')) continue
+      const base = path.basename(resolved).toLowerCase()
+      // Defense in depth: only a Markdown skill document inside a managed skill
+      // root may be removed, never the plugin's own stores or bundle resources.
+      if (!base.endsWith('.md')) continue
       if (!isInsideAny(resolved, removableRoots())) continue
       try {
         await fs.rm(resolved, { force: true })
         const directory = path.dirname(resolved)
-        if (path.basename(resolved).toLowerCase() === 'skill.md') {
+        if (base === 'skill.md') {
           const left = await fs.readdir(directory).catch(() => [])
           if (left.length === 0) await fs.rmdir(directory).catch(() => {})
         }
