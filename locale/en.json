@@ -1,0 +1,11 @@
+{
+  "meta": {
+    "title": "Agent & Skill",
+    "description": "Build your own subagents and skills from the sidebar, then call any subagent by name in a conversation."
+  },
+  "panel": {
+    "title": "Agent & Skill",
+    "agents": "Subagents",
+    "skills": "Skills"
+  }
+}

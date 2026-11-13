@@ -1,0 +1,11 @@
+{
+  "meta": {
+    "title": "智能体与技能",
+    "description": "在侧栏里自己造子智能体与技能，并在对话中按名字调用子智能体。"
+  },
+  "panel": {
+    "title": "Agent & Skill",
+    "agents": "子智能体",
+    "skills": "技能"
+  }
+}

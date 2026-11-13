@@ -1,0 +1,9 @@
+# dsh-agent-skill bundle patch.
+# The Host half stores subagent definitions and skill files, serves
+# /api/dsh-agent-skill/*, registers the `delegate_agent` tool so a session can
+# call any defined subagent by name, and injects conversation-scoped skills as
+# per-agent prompt sections. The Client half adds the "Agent & Skill" sidebar
+# entry and its two-column panel.
+- insert:
+    - id: dsh-agent-skill
+      name: dsh-agent-skill
