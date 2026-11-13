@@ -25,6 +25,8 @@ dsh plugin install /absolute/path/to/dsh-agent-skill
 
 或者把目录交给 Harness 的插件管理器（`install_bundle`）。bundle 只注册一行 `dsh-agent-skill`，由它挂上 Host 路由和 Client 面板。
 
+装完还要确认这个 bundle 在 `dsh.profile.bundles` 里被选中（`plugin_manager set_bundle`）：只装依赖时侧栏入口会出现，但 Host 半边（路由、`delegate_agent`、技能注入）只有 bundle 行启用才会加载。改了插件自己的 JavaScript 之后需要重启 Harness。
+
 ## 使用
 
 ### 1. 新建子智能体
@@ -65,8 +67,10 @@ dsh plugin install /absolute/path/to/dsh-agent-skill
 
 项目技能会展开工作区树：
 
-- **下一个新对话也能用（推荐）**——写进 `<工作区>/.dsh/skills/<技能名>/SKILL.md`，当前和之后这个工作区的每个对话都能用上。
+- **下一个新对话也能用（推荐）**——写进 `<项目根>/.dsh/skills/<技能名>/SKILL.md`，项目根是所选工作区最近的 `.git` 祖先（没有则用工作区本身），与正规技能 provider 的发现规则一致；当前和之后这个项目的对话都能用上。
 - **只在这些对话里用**——技能留在插件的托管存储里，只通过按 agent 的 system prompt 段落注入给勾选的会话，不碰工作区。
+
+编辑器会在工作区目录位于项目根之下时显示解析出的项目根，并预览真正要写入的文件路径。
 
 ### 3. 给子智能体配技能
 
@@ -82,7 +86,7 @@ dsh plugin install /absolute/path/to/dsh-agent-skill
 | 全局技能 | `<dshHome>/skills/<技能名>/SKILL.md`（以及 `<agentsHome>/skills`） |
 | 项目技能 | `<工作区>/.dsh/skills/<技能名>/SKILL.md` |
 
-这些根目录正好是 `@deepseek-ai/dsh-skill-filesystem` 扫描的位置，所以写在这里的技能不需要第二个 provider 就能进模型目录。面板也会列出插件之外创建的技能。
+这些根目录是 `@deepseek-ai/dsh-skill-filesystem` 扫描全局与项目来源时用的位置（它自己的 custom / bundled 根不在管理范围内），所以写在这里的技能不需要第二个 provider 就能进模型目录。面板也会列出插件之外创建的技能。
 
 ## HTTP 接口
 
@@ -114,11 +118,15 @@ dsh plugin install /absolute/path/to/dsh-agent-skill
 如实说明的限制：
 
 - `spawn` 子智能体看不到这段对话，任务提示必须自洽；要让子智能体接着已完成的回合干，选 `fork`。
-- 每次保存后工具枚举会刷新，新建的子智能体无需重启即可调用。
-- 子智能体的工具清单执行两次约束：`ctx.tools.restrict` 收窄它的作用域（模型看不到越界工具），`ctx.tools.guard` 在执行时兜底拒绝。
-- 技能正文以提示词注入，按次委派有字符上限；过长的 `SKILL.md` 会截断并留下标记。
-- 按对话生效的技能是提示词段落，不是目录项：模型会收到指令，但不会在 `skill` 工具目录里看到它；工作区/全局技能则按正常目录被发现。
-- 技能发现只扫一层（`<root>/<name>/SKILL.md` 或 `<root>/<name>.md`），且文件系统 provider 把项目根解析到最近的 `.git` 祖先。
+- 每次保存后工具枚举会刷新，新建的子智能体无需重启即可调用；但插件自身 JavaScript 的改动仍需重启 Harness。
+- 子智能体的工具清单执行两次约束：`ctx.tools.restrict` 收窄它的作用域（模型看不到越界工具），`ctx.tools.guard` 在执行时兜底拒绝。规则在 activation **之前**预留并持久化，activation 结束后也不撤销，因此续聊的子智能体仍受同一清单约束。
+- 传给 `ctx.subagents` 的委派深度会先经过 `subagents.resolveMaxDepth(...)`，所以 profile 里禁用委派的设置优先于定义里的深度。
+- 技能正文以提示词注入，单次委派共享 24 000 字符上限；过长会截断并留下标记。
+- 单份 `SKILL.md` 上限 48 KiB，每个 frontmatter 字段上限 4 000 字节；编辑器显示字节数，Host 在超限时直接拒绝，不会写出一个 provider 会静默跳过的技能。
+- 按对话生效的技能是提示词段落，不是目录项：模型会收到指令，但不会在 `skill` 工具目录里看到它；项目/全局技能则按正常目录被发现。
+- 删除技能只删本插件为它写过的文件，以及卡片上显示的那一个文件；其他工作区/根目录的同名技能不会被碰。新建或改名撞上已有名字会返回 `duplicate-skill`。
+- 同名技能里项目定义优先于全局，和 provider 的 rank 顺序一致。
+- 技能发现只扫一层（`<root>/<name>/SKILL.md` 或 `<root>/<name>.md`），项目根是会话 cwd 最近的 `.git` 祖先——面板写盘时用同一规则。
 
 ## 开发
 

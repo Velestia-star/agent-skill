@@ -68,13 +68,33 @@ function makeHarness({ workspaces = [], sessions = [], liveAgents = [] } = {}) {
     },
     subagents: {
       getProvider: () => ({ name: 'spawn' }),
+      resolveMaxDepth: (configured) => configured,
       startActivation: async (spec) => {
         state.activation = spec
         return {
-          childId: 'child-smoke-1',
+          childId: spec.childId ?? 'child-smoke-1',
           result: Promise.resolve({ stopReason: 'completed', output: [] }),
           dispose: async () => {},
         }
+      },
+    },
+    connection: {
+      requestRejection({ headers }) {
+        const host = String(headers.host ?? '')
+        const loopbackHost = /^(127(\.|:)|localhost(:|$)|\[::1\](:|$))/.test(host)
+        const paired = String(headers.cookie ?? '').includes('paired=1')
+        if (!loopbackHost && !paired) return 403
+        if (headers['x-forwarded-for'] !== undefined) return 403
+        if (headers['sec-fetch-site'] === 'cross-site') return 403
+        const origin = headers.origin
+        if (origin !== undefined) {
+          try {
+            if (new URL(origin).host !== host) return 403
+          } catch {
+            return 403
+          }
+        }
+        return undefined
       },
     },
     workspaceRegistry: { list: () => workspaces },
@@ -130,12 +150,12 @@ function makeHarness({ workspaces = [], sessions = [], liveAgents = [] } = {}) {
   return { ctx, state, services }
 }
 
-function makeRequest({ method = 'GET', url = '/', headers = {}, body } = {}) {
+function makeRequest({ method = 'GET', url = '/', headers = {}, body, remoteAddress = '127.0.0.1' } = {}) {
   const stream = Readable.from(body === undefined ? [] : [Buffer.from(body, 'utf8')])
   stream.method = method
   stream.url = url
   stream.headers = { host: '127.0.0.1:60800', ...headers }
-  stream.socket = { remoteAddress: '127.0.0.1' }
+  stream.socket = { remoteAddress }
   stream.destroy = () => {}
   return stream
 }
@@ -301,9 +321,9 @@ test('global skill save writes a SKILL.md under the global root', async () => {
   await stat(file)
   assert.deepEqual(saved.json.files, [file])
   const text = await readFile(file, 'utf8')
-  assert.match(text, /^---\nname: smoke-skill\n/m)
-  assert.match(text, /description: Smoke skill used by the tests\./)
-  assert.match(text, /whenToUse: During tests only\./)
+  assert.match(text, /^---\nname: "smoke-skill"\n/m)
+  assert.match(text, /description: "Smoke skill used by the tests\."/)
+  assert.match(text, /whenToUse: "During tests only\."/)
   assert.match(text, /Reply exactly: PONG/)
 
   const state = await call(harness.state, ROUTES.state)
@@ -423,8 +443,9 @@ test('delegating a spawn agent injects the attached skill and honours the route'
     { agent: 'pong-runner', prompt: 'Do the thing.' },
     { agent: { id: 'parent-session' }, signal: new AbortController().signal },
   )
-  assert.equal(childId, 'child-smoke-1')
+  assert.match(childId, /^[0-9a-f-]{36}$/)
   const spec = harness.state.activation
+  assert.equal(spec.childId, childId)
   assert.equal(spec.provider, 'spawn')
   assert.equal(spec.delivery, 'parent')
   assert.deepEqual(spec.request.agentOptions, {
@@ -432,6 +453,7 @@ test('delegating a spawn agent injects the attached skill and honours the route'
     model: 'fake-model',
     reasoningEffort: 'low',
   })
+  assert.equal(spec.request.maxDepth, 1)
   const prompt = spec.request.prompt[0].text
   assert.match(prompt, /Reply exactly: PONG/)
   assert.match(prompt, /Do the thing\./)
@@ -460,11 +482,26 @@ test('delegating a fork agent selects the fork backend', async () => {
 })
 
 test('deleting a skill removes the files this plugin wrote', async () => {
+  // A same-named skill in a different root is NOT owned by this panel; deleting
+  // the global skill must leave it alone.
+  const decoy = path.join(workspaceB, '.dsh', 'skills', 'smoke-skill', 'SKILL.md')
+  await mkdir(path.dirname(decoy), { recursive: true })
+  await writeFile(decoy, '---\nname: smoke-skill\ndescription: decoy\n---\nDecoy.\n', 'utf8')
+
   const globalFile = path.join(root, 'dsh-home', 'skills', 'smoke-skill', 'SKILL.md')
   await stat(globalFile)
   const deleted = await post(harness.state, ROUTES.skillDelete, { name: 'smoke-skill' })
   assert.equal(deleted.status, 200)
   await assert.rejects(stat(globalFile))
+  await stat(decoy)
+
+  // A delete request may not point at the plugin's own stores.
+  const storeAttack = await post(harness.state, ROUTES.skillDelete, {
+    name: 'smoke-skill',
+    path: path.join(root, 'dsh-home', 'agent-skill', 'agents.json'),
+  })
+  assert.equal(storeAttack.status, 400)
+  assert.equal(storeAttack.json.error, 'invalid-delete-target')
 
   const projectFile = path.join(workspaceA, '.dsh', 'skills', 'project-skill', 'SKILL.md')
   await stat(projectFile)
@@ -475,11 +512,12 @@ test('deleting a skill removes the files this plugin wrote', async () => {
   await post(harness.state, ROUTES.skillDelete, { name: 'session-skill' })
   await assert.rejects(stat(managedFile))
 
+  await rm(decoy, { force: true })
   const state = await call(harness.state, ROUTES.state)
   assert.deepEqual(
     state.json.skills.map((skill) => skill.name),
     [],
-    'all three managed skills are gone',
+    'all managed skills are gone, the unowned decoy was removed by hand',
   )
 })
 
@@ -501,6 +539,183 @@ test('renaming a skill moves the directory and drops the old one', async () => {
   })
   await assert.rejects(stat(oldFile))
   await stat(path.join(root, 'dsh-home', 'skills', 'after-name', 'SKILL.md'))
+})
+
+test('a project skill targets the nearest .git root the provider scans', async () => {
+  const repo = path.join(root, 'repo')
+  await mkdir(path.join(repo, '.git'), { recursive: true })
+  const nested = path.join(repo, 'packages', 'app')
+  await mkdir(nested, { recursive: true })
+  const registry = harness.services.workspaceRegistry.list()
+  registry.push({ path: nested, title: 'Nested app' })
+  try {
+    const state = await call(harness.state, ROUTES.state, { url: `${ROUTES.state}?fresh=1` })
+    const workspace = state.json.workspaces.find((entry) => entry.path === nested)
+    assert.equal(workspace.projectRoot, repo)
+
+    const saved = await post(harness.state, ROUTES.skillSave, {
+      name: 'nested-skill',
+      description: 'Nested skill.',
+      content: 'Body.',
+      scope: 'project',
+      workspaces: [{ path: nested, mode: 'workspace' }],
+    })
+    assert.equal(saved.status, 200)
+    const file = path.join(repo, '.dsh', 'skills', 'nested-skill', 'SKILL.md')
+    assert.deepEqual(saved.json.files, [file])
+    await stat(file)
+
+    await post(harness.state, ROUTES.skillDelete, { name: 'nested-skill' })
+    await assert.rejects(stat(file))
+  } finally {
+    registry.pop()
+  }
+})
+
+test('a project skill may not write outside a registered workspace', async () => {
+  const escape = await post(harness.state, ROUTES.skillSave, {
+    name: 'escape-skill',
+    description: 'Escape attempt.',
+    content: 'Body.',
+    scope: 'project',
+    workspaces: [{ path: path.join(root, 'not-a-workspace'), mode: 'workspace' }],
+  })
+  assert.equal(escape.status, 400)
+  assert.equal(escape.json.error, 'workspace-unknown')
+  await assert.rejects(stat(path.join(root, 'not-a-workspace', '.dsh', 'skills', 'escape-skill', 'SKILL.md')))
+})
+
+test('a new skill may not overwrite an existing name', async () => {
+  const first = await post(harness.state, ROUTES.skillSave, {
+    name: 'dup-check',
+    description: 'First.',
+    content: 'First body.',
+    scope: 'global',
+  })
+  assert.equal(first.status, 200)
+  const second = await post(harness.state, ROUTES.skillSave, {
+    name: 'dup-check',
+    description: 'Second.',
+    content: 'Second body.',
+    scope: 'global',
+  })
+  assert.equal(second.status, 409)
+  assert.equal(second.json.error, 'duplicate-skill')
+  await post(harness.state, ROUTES.skillDelete, { name: 'dup-check' })
+})
+
+test('a skill body over the provider read limit is rejected at save time', async () => {
+  const big = await post(harness.state, ROUTES.skillSave, {
+    name: 'too-big',
+    description: 'Too big.',
+    content: 'x'.repeat(49 * 1024),
+    scope: 'global',
+  })
+  assert.equal(big.status, 400)
+  assert.equal(big.json.error, 'skill-too-large')
+})
+
+test('frontmatter survives colons, hashes and boolean-looking text', async () => {
+  const description = 'Reviews changes: finds regressions #1 (true)'
+  const saved = await post(harness.state, ROUTES.skillSave, {
+    name: 'yaml-skill',
+    description,
+    whenToUse: 'When: the user asks',
+    content: 'Body.',
+    scope: 'global',
+  })
+  assert.equal(saved.status, 200)
+  const file = path.join(root, 'dsh-home', 'skills', 'yaml-skill', 'SKILL.md')
+  const raw = await readFile(file, 'utf8')
+  assert.match(raw, /description: "Reviews changes: finds regressions #1 \(true\)"/)
+  const state = await call(harness.state, ROUTES.state)
+  const skill = state.json.skills.find((entry) => entry.name === 'yaml-skill')
+  assert.equal(skill.description, description)
+  assert.equal(skill.whenToUse, 'When: the user asks')
+  await post(harness.state, ROUTES.skillDelete, { name: 'yaml-skill' })
+})
+
+test('a child allowlist is registered before activation and survives the activation', async () => {
+  harness.state.tools.set('read', { name: 'read', description: 'fake read tool' })
+  const saved = await post(harness.state, ROUTES.agentSave, { name: 'restricted', tools: ['read'] })
+  assert.deepEqual(saved.json.agent.tools, ['read'])
+
+  const tool = harness.state.tools.get('delegate_agent')
+  const childId = await tool.execute(
+    { agent: 'restricted', prompt: 'x' },
+    { agent: { id: 'parent-session' }, signal: new AbortController().signal },
+  )
+  const children = JSON.parse(
+    await readFile(path.join(root, 'dsh-home', 'agent-skill', 'children.json'), 'utf8'),
+  )
+  assert.deepEqual(children.children[childId].allow, ['read'])
+
+  let restriction
+  const agentCtx = {
+    get: (service) =>
+      service === 'tools'
+        ? {
+            restrict(filter) {
+              restriction = filter
+              return () => {}
+            },
+          }
+        : undefined,
+    effect: (fn) => {
+      const dispose = fn()
+      return typeof dispose === 'function' ? dispose : () => {}
+    },
+  }
+  for (const listener of harness.state.listeners.get('agent/created') ?? []) {
+    await listener({ agent: { id: childId, ctx: agentCtx } })
+  }
+  assert.deepEqual(restriction.allow, ['read'])
+
+  const guard = harness.state.guards[0]
+  assert.match(guard({ agent: { id: childId }, name: 'grep' }), /不在子智能体/)
+  assert.equal(guard({ agent: { id: childId }, name: 'read' }), undefined)
+
+  // Saving `tools: null` is an explicit reset to the full tool set.
+  const reset = await post(harness.state, ROUTES.agentSave, {
+    id: saved.json.agent.id,
+    name: 'restricted',
+    tools: null,
+  })
+  assert.equal(reset.status, 200)
+  assert.equal(reset.json.agent.tools, null)
+})
+
+test('delegation defers the depth policy to the host resolver', async () => {
+  const original = harness.services.subagents.resolveMaxDepth
+  harness.services.subagents.resolveMaxDepth = () => 0
+  try {
+    const tool = harness.state.tools.get('delegate_agent')
+    await tool.execute(
+      { agent: 'forker', prompt: 'x' },
+      { agent: { id: 'parent-session' }, signal: new AbortController().signal },
+    )
+    assert.equal(harness.state.activation.request.maxDepth, 0)
+  } finally {
+    harness.services.subagents.resolveMaxDepth = original
+  }
+})
+
+test('the route fence accepts a paired remote page through the connection service', async () => {
+  const paired = await call(harness.state, ROUTES.state, {
+    headers: {
+      host: '192.168.1.9:49803',
+      origin: 'http://192.168.1.9:49803',
+      cookie: 'paired=1',
+    },
+    remoteAddress: '192.168.1.9',
+  })
+  assert.equal(paired.status, 200)
+
+  const anonymous = await call(harness.state, ROUTES.state, {
+    headers: { host: '192.168.1.9:49803', origin: 'http://192.168.1.9:49803' },
+    remoteAddress: '192.168.1.9',
+  })
+  assert.equal(anonymous.status, 403)
 })
 
 test('the route fence rejects cross-origin and foreign-host requests', async () => {

@@ -25,6 +25,8 @@ dsh plugin install /absolute/path/to/dsh-agent-skill
 
 Or hand the directory to the Harness plugin manager (`install_bundle`). The bundle registers one row, `dsh-agent-skill`, which mounts the Host routes and the Client panel.
 
+Make sure the bundle is also selected in `dsh.profile.bundles` (`plugin_manager set_bundle`): an installed dependency alone ships the sidebar entry, but the Host half — routes, `delegate_agent`, skill injection — only loads when the bundle row is enabled. A restart of the Harness is required after changing the plugin's own JavaScript.
+
 ## Use it
 
 ### 1. Create a subagent
@@ -65,8 +67,10 @@ The model calls `delegate_agent`, which starts the child through `ctx.subagents`
 
 Project skills offer a workspace tree:
 
-- **Next new conversation (recommended)** — writes `<workspace>/.dsh/skills/<name>/SKILL.md`, so this and every later conversation in that workspace has it.
+- **Next new conversation (recommended)** — writes `<projectRoot>/.dsh/skills/<name>/SKILL.md`, where `<projectRoot>` is the nearest `.git` ancestor of the selected workspace (the workspace itself when it has none), matching the rule the shipped skill filesystem provider uses. This and every later conversation in that project has it.
 - **Only in selected conversations** — keeps the bundle in the plugin's managed store and injects its instructions only into the checked sessions through a per-agent system-prompt section. It does not touch the workspace.
+
+The editor shows the resolved project root next to a workspace whose directory is below it, and previews the exact file paths it will write.
 
 ### 3. Attach skills to a subagent
 
@@ -82,7 +86,7 @@ In the subagent editor pick the skills under **Skills**. At delegation time the 
 | Global skills | `<dshHome>/skills/<name>/SKILL.md` (plus `<agentsHome>/skills`) |
 | Project skills | `<workspace>/.dsh/skills/<name>/SKILL.md` |
 
-Those skill roots are exactly the ones `@deepseek-ai/dsh-skill-filesystem` scans, so anything written here reaches agents without a second provider. The panel also lists skills created outside it.
+Those skill roots are the ones `@deepseek-ai/dsh-skill-filesystem` scans for the global and project sources (its custom and bundled roots are left alone), so anything written here reaches agents without a second provider. The panel also lists skills created outside it.
 
 ## HTTP surface
 
@@ -114,11 +118,15 @@ One tool is registered globally: `delegate_agent`.
 Honest limits:
 
 - A `spawn` child does not see this conversation; write the prompt so it stands alone. Use `fork` when the child must build on the finished turns.
-- The tool enum refreshes after every save, so a newly created subagent is callable immediately without a restart.
-- The child's tool allowlist is enforced twice: `ctx.tools.restrict` on the child scope (the model stops seeing the tools) and a `ctx.tools.guard` denial at execution.
-- Skill bodies are injected as prompt text, capped per delegation; a huge `SKILL.md` is truncated with a marker.
-- Conversation-scoped skills are prompt sections, not catalog entries: the model receives the instructions but does not see a `skill` tool entry for them. Workspace and global skills are discovered normally.
-- Skill discovery is one level deep (`<root>/<name>/SKILL.md` or `<root>/<name>.md`), and the filesystem provider resolves the project root to the nearest `.git` ancestor.
+- The tool enum refreshes after every save, so a newly created subagent is callable immediately without a restart. The plugin's own JavaScript changes still need a Harness restart.
+- The child's tool allowlist is enforced twice: a `ctx.tools.restrict` scoped to the child (the model stops seeing the tools) and a `ctx.tools.guard` denial at execution. The rule is reserved and persisted **before** activation and kept after the activation settles, so a resumed child keeps the same allowlist.
+- The launch depth passed to `ctx.subagents` is resolved through `subagents.resolveMaxDepth(...)`, so a profile that disables delegation still wins over a definition's own limit.
+- Skill bodies are injected as prompt text, capped at 24 000 characters per delegation (shared across the attached skills); a huge body is truncated with a marker.
+- A `SKILL.md` is limited to 48 KiB and each frontmatter field to 4 000 bytes; the editor counts bytes and the Host rejects an over-limit body instead of writing a skill the provider would silently skip.
+- Conversation-scoped skills are prompt sections, not catalog entries: the model receives the instructions but does not see a `skill` tool entry for them. Project and global skills are discovered normally.
+- Deleting a skill removes only files this plugin wrote for that skill plus the exact file the card shows; a same-named skill in another workspace or root is left untouched. Creating or renaming onto an existing name is refused with `duplicate-skill`.
+- Project definitions outrank global ones by name, matching the provider's rank order.
+- Skill discovery is one level deep (`<root>/<name>/SKILL.md` or `<root>/<name>.md`), and a project root is the nearest `.git` ancestor of the session cwd — the panel uses the same rule when it writes.
 
 ## Development
 

@@ -34,9 +34,10 @@
  *   POST /api/dsh-agent-skill/skills/delete
  */
 
-import { promises as fs } from 'node:fs'
+import { existsSync, promises as fs } from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
+import { randomUUID } from 'node:crypto'
 
 const PLUGIN_ID = 'dsh-agent-skill'
 const ROUTE_BASE = '/api/dsh-agent-skill'
@@ -54,6 +55,7 @@ const SECTION_NAME = `${PLUGIN_ID}/session-skills`
 
 const MAX_BODY_BYTES = 512 * 1024
 const MAX_SKILL_BYTES = 48 * 1024
+const MAX_SKILL_DESCRIPTION_BYTES = 4_000
 const MAX_INJECTED_SKILL_CHARS = 24_000
 const MAX_AGENT_NAME = 48
 const MAX_LISTED_SESSIONS = 400
@@ -85,8 +87,16 @@ function bindingsFile() {
   return path.join(storeDir(), 'skills.json')
 }
 
+function managedRoot() {
+  return path.join(storeDir(), 'managed-skills')
+}
+
 function managedSkillDir(name) {
-  return path.join(storeDir(), 'managed-skills', name)
+  return path.join(managedRoot(), name)
+}
+
+function childrenFile() {
+  return path.join(storeDir(), 'children.json')
 }
 
 function canonicalKey(value) {
@@ -178,6 +188,20 @@ function lookupPairing(ctx) {
 
 function isAllowed(ctx, request) {
   if (isLoopbackRequest(request)) return true
+  // Connection owns the browser-authentication fence for every /api route; ask
+  // it before the local pairing fallback so a paired/remote page keeps working.
+  const connection = useService(ctx, 'connection')
+  if (connection && typeof connection.requestRejection === 'function') {
+    try {
+      const rejection = connection.requestRejection({
+        headers: request.headers,
+      })
+      if (rejection === undefined) return true
+      return false
+    } catch {
+      /* fall through to the pairing check */
+    }
+  }
   try {
     return lookupPairing(ctx)?.isPairedDevice?.(request) === true
   } catch {
@@ -245,6 +269,12 @@ function methodAllowed(request, response, methods) {
   return false
 }
 
+function httpError(status, code) {
+  const error = new Error(code)
+  error.status = status
+  return error
+}
+
 /* ------------------------------------------------------------ frontmatter */
 
 /**
@@ -286,8 +316,16 @@ function parseFrontmatter(text) {
     if (trimmed.length >= 2) {
       const first = trimmed[0]
       const last = trimmed[trimmed.length - 1]
-      if ((first === '"' && last === '"') || (first === "'" && last === "'")) {
-        data[key] = trimmed.slice(1, -1).replace(/\\(["'\\])/g, '$1')
+      if (first === '"' && last === '"') {
+        try {
+          data[key] = JSON.parse(trimmed)
+        } catch {
+          data[key] = trimmed.slice(1, -1).replace(/\\"/g, '"').replace(/\\\\/g, '\\')
+        }
+        continue
+      }
+      if (first === "'" && last === "'") {
+        data[key] = trimmed.slice(1, -1).replace(/''/g, "'")
         continue
       }
     }
@@ -297,10 +335,11 @@ function parseFrontmatter(text) {
 }
 
 function yamlScalar(value) {
-  const text = String(value ?? '')
-  if (text === '') return '""'
-  if (/^[A-Za-z0-9][A-Za-z0-9 .,:/_()[\]\-—·（）]*$/.test(text) && !/[:#]$/.test(text)) return text
-  return JSON.stringify(text)
+  // A JSON string is a valid YAML double-quoted scalar, and it is the only form
+  // that survives `: `, ` #`, leading indicators, boolean/number lookalikes and
+  // embedded newlines. The shipped filesystem provider parses frontmatter with
+  // the real `yaml` package and drops a skill whose fields are not strings.
+  return JSON.stringify(String(value ?? ''))
 }
 
 function renderSkillFile({ name, description, whenToUse, content }) {
@@ -350,6 +389,21 @@ async function readSkillFile(filePath) {
 
 /* ------------------------------------------------------------ workspaces */
 
+/**
+ * The skill filesystem provider resolves a project root to the nearest `.git`
+ * ancestor of the session cwd (falling back to the cwd). Use the same rule so a
+ * skill written for a workspace is the skill the model actually discovers.
+ */
+function projectRootOf(workspacePath) {
+  let current = path.resolve(workspacePath)
+  for (;;) {
+    if (existsSync(path.join(current, '.git'))) return current
+    const parent = path.dirname(current)
+    if (parent === current) return path.resolve(workspacePath)
+    current = parent
+  }
+}
+
 function listWorkspaces(ctx) {
   const out = []
   const seen = new Set()
@@ -371,7 +425,14 @@ function listWorkspaces(ctx) {
         typeof workspace?.title === 'string' && workspace.title.trim() !== ''
           ? workspace.title.trim()
           : path.basename(workspacePath) || workspacePath
-      out.push({ path: workspacePath, title })
+      const projectRoot = projectRootOf(workspacePath)
+      out.push({
+        path: workspacePath,
+        title,
+        projectRoot,
+        // True when the workspace itself is the project root the provider scans.
+        projectRootIsWorkspace: canonicalKey(projectRoot) === key,
+      })
     }
   }
   return out
@@ -379,9 +440,18 @@ function listWorkspaces(ctx) {
 
 function workspaceSkillRoots(workspaces) {
   const rows = []
+  const seen = new Set()
   for (const workspace of workspaces) {
-    rows.push({ root: path.join(workspace.path, '.dsh', 'skills'), scope: 'project', workspace })
-    rows.push({ root: path.join(workspace.path, '.agents', 'skills'), scope: 'project', workspace })
+    const root = workspace.projectRoot ?? workspace.path
+    for (const candidate of [
+      path.join(root, '.dsh', 'skills'),
+      path.join(root, '.agents', 'skills'),
+    ]) {
+      const key = canonicalKey(candidate)
+      if (seen.has(key)) continue
+      seen.add(key)
+      rows.push({ root: candidate, scope: 'project', workspace, projectRoot: root })
+    }
   }
   return rows
 }
@@ -420,6 +490,7 @@ async function scanSkillRoot(root, meta) {
       source: 'filesystem',
       workspacePath: meta.workspace?.path,
       workspaceName: meta.workspace?.title,
+      projectRoot: meta.projectRoot,
       root,
       writable: true,
     })
@@ -456,6 +527,8 @@ function normalizeAgent(raw, existing) {
   const maxDepthRaw = Number(raw?.maxDepth ?? existing?.maxDepth ?? 1)
   const maxDepth = Number.isFinite(maxDepthRaw) ? Math.max(0, Math.trunc(maxDepthRaw)) : 1
   if (model !== '' && provider === '') throw new Error('model-provider-required')
+  // `null` is an explicit "all tools"; only an omitted field inherits.
+  const toolsSource = raw !== null && raw !== undefined && raw.tools !== undefined ? raw.tools : existing?.tools
 
   return {
     id: existing?.id || `agent_${now.toString(36)}_${Math.random().toString(36).slice(2, 8)}`,
@@ -468,7 +541,7 @@ function normalizeAgent(raw, existing) {
     model: model === '' ? undefined : model,
     reasoningEffort: reasoningEffort === '' ? undefined : reasoningEffort,
     maxDepth,
-    tools: normalizeToolList(raw?.tools ?? existing?.tools),
+    tools: normalizeToolList(toolsSource),
     skills: Array.isArray(raw?.skills ?? existing?.skills)
       ? [
           ...new Set(
@@ -484,6 +557,7 @@ function normalizeAgent(raw, existing) {
 }
 
 let writeChain = Promise.resolve()
+let mutationChain = Promise.resolve()
 
 function serializeWrite(task) {
   const run = writeChain.then(task)
@@ -491,9 +565,36 @@ function serializeWrite(task) {
   return run
 }
 
-async function readAgentStore() {
+/** Serialize a whole read-modify-write of the plugin stores, so two concurrent
+ * saves cannot drop one another's update. */
+function withMutation(task) {
+  const run = mutationChain.then(task)
+  mutationChain = run.catch(() => {})
+  return run
+}
+
+async function quarantineCorrupt(file, error) {
   try {
-    const text = await fs.readFile(agentsFile(), 'utf8')
+    const stamp = new Date().toISOString().replace(/[:.]/g, '-')
+    await fs.rename(file, `${file}.corrupt-${stamp}`)
+  } catch {
+    /* keep the original file when it cannot be moved */
+  }
+  try {
+    console.warn(`dsh-agent-skill: ${file} is not valid JSON (${error?.message ?? error}); kept as .corrupt-*`)
+  } catch {
+    /* ignore */
+  }
+}
+
+async function readAgentStore() {
+  let text
+  try {
+    text = await fs.readFile(agentsFile(), 'utf8')
+  } catch {
+    return []
+  }
+  try {
     const parsed = JSON.parse(text)
     const list = Array.isArray(parsed?.agents) ? parsed.agents : []
     return list
@@ -505,7 +606,8 @@ async function readAgentStore() {
         mode: agent.mode === 'fork' ? 'fork' : 'spawn',
         maxDepth: Number.isFinite(agent.maxDepth) ? agent.maxDepth : 1,
       }))
-  } catch {
+  } catch (error) {
+    await quarantineCorrupt(agentsFile(), error)
     return []
   }
 }
@@ -528,13 +630,19 @@ function emptyBindings() {
 }
 
 async function readBindings() {
+  let text
   try {
-    const text = await fs.readFile(bindingsFile(), 'utf8')
+    text = await fs.readFile(bindingsFile(), 'utf8')
+  } catch {
+    return emptyBindings()
+  }
+  try {
     const parsed = JSON.parse(text)
     const bindings = parsed?.bindings
     if (bindings === null || typeof bindings !== 'object' || Array.isArray(bindings)) return emptyBindings()
     return { version: 1, bindings }
-  } catch {
+  } catch (error) {
+    await quarantineCorrupt(bindingsFile(), error)
     return emptyBindings()
   }
 }
@@ -578,21 +686,22 @@ async function collectSkills(ctx) {
       })
       return
     }
-    // Global before project is the display precedence; remember that a second
-    // definition exists instead of hiding it.
+    // Project definitions outrank user/global ones, matching the shipped
+    // filesystem provider's rank (project-dsh 100 … user-dsh 400 … user-agents 500).
     previous.alternates = [...(previous.alternates ?? []), skill.path]
   }
 
-  for (const entry of roots) {
-    const skills = await scanSkillRoot(entry.root, { scope: 'global' })
-    for (const skill of skills) absorb({ ...skill, workspaceName: '全局' })
-  }
   for (const entry of projectRoots) {
     const skills = await scanSkillRoot(entry.root, {
       scope: 'project',
       workspace: { path: entry.workspace.path, title: entry.workspace.title },
+      projectRoot: entry.projectRoot,
     })
     for (const skill of skills) absorb(skill)
+  }
+  for (const entry of roots) {
+    const skills = await scanSkillRoot(entry.root, { scope: 'global' })
+    for (const skill of skills) absorb({ ...skill, workspaceName: '全局' })
   }
 
   // Managed copies back the skills bound to individual conversations.
@@ -621,6 +730,7 @@ function presentBinding(binding) {
     workspaces: (binding.workspaces ?? []).map((entry) => ({
       path: entry.path,
       title: entry.title,
+      root: entry.root,
       mode: entry.mode === 'sessions' ? 'sessions' : 'workspace',
       sessions: Array.isArray(entry.sessions) ? entry.sessions : [],
     })),
@@ -741,8 +851,8 @@ function workspaceForCwd(workspaces, cwd) {
   return workspaces.find((workspace) => key.startsWith(canonicalKey(workspace.path) + path.sep))
 }
 
-async function listSessions(ctx, workspaces) {
-  if (Date.now() - sessionCache.at < SESSION_CACHE_MS) return sessionCache.value
+async function listSessions(ctx, workspaces, options = {}) {
+  if (options.fresh !== true && Date.now() - sessionCache.at < SESSION_CACHE_MS) return sessionCache.value
   const rows = []
   const seen = new Set()
   const query = useService(ctx, 'sessionQuery')
@@ -756,6 +866,9 @@ async function listSessions(ctx, workspaces) {
   }
   const ordered = records
     .filter((record) => record?.header?.id !== undefined)
+    // A subagent session is a delegated worker, never a conversation a user
+    // picks a project skill for.
+    .filter((record) => record.header.origin !== 'subagent')
     .sort((a, b) => (b.header.createdAt ?? 0) - (a.header.createdAt ?? 0))
     .slice(0, MAX_LISTED_SESSIONS)
 
@@ -806,6 +919,7 @@ async function listSessions(ctx, workspaces) {
       const session = agent?.session
       const id = session?.id ?? session?.header?.id ?? agent?.id
       if (typeof id !== 'string' || id === '' || seen.has(id)) continue
+      if (session?.header?.origin === 'subagent') continue
       seen.add(id)
       let cwd
       try {
@@ -827,6 +941,41 @@ async function listSessions(ctx, workspaces) {
 
   sessionCache = { at: Date.now(), value: rows }
   return rows
+}
+
+/* ------------------------------------------------------- child tool rules */
+
+const MAX_CHILD_RULES = 200
+
+async function readChildRules() {
+  try {
+    const text = await fs.readFile(childrenFile(), 'utf8')
+    const parsed = JSON.parse(text)
+    const children = parsed?.children
+    if (children === null || typeof children !== 'object' || Array.isArray(children)) return {}
+    return children
+  } catch {
+    return {}
+  }
+}
+
+function pruneChildRules(children) {
+  const entries = Object.entries(children)
+    .filter(([id, record]) => typeof id === 'string' && id !== '' && record !== null && typeof record === 'object')
+    .sort((a, b) => (b[1].at ?? 0) - (a[1].at ?? 0))
+    .slice(0, MAX_CHILD_RULES)
+  return Object.fromEntries(entries)
+}
+
+async function writeChildRules(children) {
+  await serializeWrite(async () => {
+    const file = childrenFile()
+    await fs.mkdir(path.dirname(file), { recursive: true })
+    const payload = JSON.stringify({ version: 1, children: pruneChildRules(children) }, null, 2)
+    const temporary = `${file}.${process.pid}.tmp`
+    await fs.writeFile(temporary, payload, 'utf8')
+    await fs.rename(temporary, file)
+  })
 }
 
 /* ------------------------------------------------------------ child prompt */
@@ -862,6 +1011,8 @@ export const inject = ['webServer', 'tools', 'subagents']
 export function apply(ctx) {
   /** childId -> { allow: Set<string> | null, label: string } */
   const childRules = new Map()
+  /** childId -> disposer of the scope tool restriction */
+  const restrictionDisposers = new Map()
   /** agentId -> () => void  (session-scoped skill section) */
   const sessionSections = new Map()
   let toolDisposer
@@ -875,6 +1026,45 @@ export function apply(ctx) {
     }
   }
 
+  const persistChildRule = async (childId, rule) => {
+    try {
+      const children = await readChildRules()
+      children[childId] = {
+        allow: rule.allow === null ? null : [...rule.allow],
+        label: rule.label,
+        at: Date.now(),
+      }
+      await writeChildRules(children)
+    } catch (error) {
+      logWarn(`could not persist child rule: ${error instanceof Error ? error.message : String(error)}`)
+    }
+  }
+
+  const dropChildRule = async (childId) => {
+    childRules.delete(childId)
+    try {
+      const children = await readChildRules()
+      if (children[childId] !== undefined) {
+        delete children[childId]
+        await writeChildRules(children)
+      }
+    } catch {
+      /* the in-memory rule is already gone */
+    }
+  }
+
+  const loadChildRules = async () => {
+    const children = await readChildRules()
+    for (const [childId, record] of Object.entries(children)) {
+      if (typeof childId !== 'string' || childId === '' || record === null || typeof record !== 'object') continue
+      const allow =
+        record.allow === null || record.allow === undefined
+          ? null
+          : new Set((Array.isArray(record.allow) ? record.allow : []).map(String))
+      childRules.set(childId, { allow, label: String(record.label ?? 'subagent') })
+    }
+  }
+
   const allowedRootsForSkills = () => {
     const { roots, projectRoots } = allSkillRoots(ctx)
     return [...roots, ...projectRoots].map((entry) => canonicalKey(entry.root))
@@ -885,12 +1075,14 @@ export function apply(ctx) {
   const handleState = async (request, response) => {
     if (!methodAllowed(request, response, ['GET', 'HEAD'])) return
     try {
+      const url = requestUrl(request)
+      const fresh = url?.searchParams.get('fresh') === '1'
       const workspaces = listWorkspaces(ctx)
       const [agents, skills, models, sessions] = await Promise.all([
         readAgentStore(),
         collectSkills(ctx),
-        collectModels(ctx),
-        listSessions(ctx, workspaces),
+        collectModels(ctx, { fresh }),
+        listSessions(ctx, workspaces, { fresh }),
       ])
       currentAgents = agents
       sendJson(request, response, 200, {
@@ -987,26 +1179,27 @@ export function apply(ctx) {
       return
     }
     try {
-      const agents = await readAgentStore()
-      const targetId = typeof body.id === 'string' ? body.id : undefined
-      const existingIndex = targetId ? agents.findIndex((agent) => agent.id === targetId) : -1
-      const existing = existingIndex >= 0 ? agents[existingIndex] : undefined
-      const next = normalizeAgent(body, existing)
-      const clash = agents.some(
-        (agent, index) => index !== existingIndex && agent.name.toLowerCase() === next.name.toLowerCase(),
-      )
-      if (clash) {
-        sendJson(request, response, 409, { error: 'agent-name-taken' })
-        return
-      }
-      if (existingIndex >= 0) agents[existingIndex] = next
-      else agents.push(next)
-      await writeAgentStore(agents)
-      currentAgents = agents
+      const result = await withMutation(async () => {
+        const agents = await readAgentStore()
+        const targetId = typeof body.id === 'string' ? body.id : undefined
+        const existingIndex = targetId ? agents.findIndex((agent) => agent.id === targetId) : -1
+        const existing = existingIndex >= 0 ? agents[existingIndex] : undefined
+        const next = normalizeAgent(body, existing)
+        const clash = agents.some(
+          (agent, index) => index !== existingIndex && agent.name.toLowerCase() === next.name.toLowerCase(),
+        )
+        if (clash) throw httpError(409, 'agent-name-taken')
+        if (existingIndex >= 0) agents[existingIndex] = next
+        else agents.push(next)
+        await writeAgentStore(agents)
+        return { agent: next, agents }
+      })
+      currentAgents = result.agents
       syncDelegateTool()
-      sendJson(request, response, 200, { agent: next, agents })
+      sendJson(request, response, 200, result)
     } catch (error) {
-      sendJson(request, response, 400, { error: error instanceof Error ? error.message : 'save-failed' })
+      const status = Number(error?.status) === 409 ? 409 : 400
+      sendJson(request, response, status, { error: error instanceof Error ? error.message : 'save-failed' })
     }
   }
 
@@ -1024,19 +1217,39 @@ export function apply(ctx) {
       sendJson(request, response, 400, { error: 'id-required' })
       return
     }
-    const agents = (await readAgentStore()).filter((agent) => agent.id !== id)
-    await writeAgentStore(agents)
-    currentAgents = agents
-    syncDelegateTool()
-    sendJson(request, response, 200, { agents })
+    try {
+      const agents = await withMutation(async () => {
+        const next = (await readAgentStore()).filter((agent) => agent.id !== id)
+        await writeAgentStore(next)
+        return next
+      })
+      currentAgents = agents
+      syncDelegateTool()
+      sendJson(request, response, 200, { agents })
+    } catch (error) {
+      sendJson(request, response, 500, { error: error instanceof Error ? error.message : 'delete-failed' })
+    }
   }
+
+  const isSkillFileTarget = (file, name) => {
+    const base = path.basename(file).toLowerCase()
+    if (base === 'skill.md') return true
+    return name !== '' && base === `${name}.md`
+  }
+
+  const removableRoots = () => [...allowedRootsForSkills(), canonicalKey(managedRoot())]
 
   const removeFiles = async (files) => {
     for (const file of files ?? []) {
+      const resolved = path.resolve(file)
+      // Defense in depth: only skill documents inside a managed skill root may be
+      // removed, never the plugin's own stores or bundle resources.
+      if (!isSkillFileTarget(resolved, '')) continue
+      if (!isInsideAny(resolved, removableRoots())) continue
       try {
-        await fs.rm(file, { force: true })
-        const directory = path.dirname(file)
-        if (path.basename(file).toLowerCase() === 'skill.md') {
+        await fs.rm(resolved, { force: true })
+        const directory = path.dirname(resolved)
+        if (path.basename(resolved).toLowerCase() === 'skill.md') {
           const left = await fs.readdir(directory).catch(() => [])
           if (left.length === 0) await fs.rmdir(directory).catch(() => {})
         }
@@ -1057,96 +1270,107 @@ export function apply(ctx) {
     }
     try {
       const name = normalizeSkillName(body.name)
-      if (!SKILL_NAME_RE.test(name)) {
-        sendJson(request, response, 400, { error: 'invalid-skill-name' })
-        return
-      }
+      if (!SKILL_NAME_RE.test(name)) throw httpError(400, 'invalid-skill-name')
       const description = String(body.description ?? '').trim()
-      if (description === '') {
-        sendJson(request, response, 400, { error: 'description-required' })
-        return
+      if (description === '') throw httpError(400, 'description-required')
+      if (Buffer.byteLength(description, 'utf8') > MAX_SKILL_DESCRIPTION_BYTES) {
+        throw httpError(400, 'description-too-long')
+      }
+      const whenToUse = String(body.whenToUse ?? '').trim()
+      if (Buffer.byteLength(whenToUse, 'utf8') > MAX_SKILL_DESCRIPTION_BYTES) {
+        throw httpError(400, 'when-to-use-too-long')
       }
       const content = String(body.content ?? '')
-      const whenToUse = String(body.whenToUse ?? '').trim()
       const scope = body.scope === 'project' ? 'project' : 'global'
       const originalName = normalizeSkillName(body.originalName)
+      const text = renderSkillFile({ name, description, whenToUse, content })
+      // `readSkillFile` drops anything above this limit, so refuse to write a
+      // skill the model could never discover.
+      if (Buffer.byteLength(text, 'utf8') > MAX_SKILL_BYTES) throw httpError(400, 'skill-too-large')
       const workspaces = listWorkspaces(ctx)
-      const knownWorkspace = new Map(workspaces.map((workspace) => [canonicalKey(workspace.path), workspace]))
-      const state = await readBindings()
-      const previous = originalName !== '' ? state.bindings[originalName] : state.bindings[name]
+      const knownWorkspace = new Map(
+        workspaces.map((workspace) => [canonicalKey(workspace.path), workspace]),
+      )
 
-      const files = []
-      const selection = []
-      if (scope === 'global') {
-        const file = path.join(resolveDshHome(), 'skills', name, 'SKILL.md')
-        await fs.mkdir(path.dirname(file), { recursive: true })
-        await fs.writeFile(file, renderSkillFile({ name, description, whenToUse, content }), 'utf8')
-        files.push(file)
-      } else {
-        const requested = Array.isArray(body.workspaces) ? body.workspaces : []
-        for (const entry of requested) {
-          const workspacePath = String(entry?.path ?? '').trim()
-          if (workspacePath === '') continue
-          const workspace = knownWorkspace.get(canonicalKey(workspacePath))
-          const resolvedPath = workspace?.path ?? path.resolve(workspacePath)
-          const mode = entry?.mode === 'sessions' ? 'sessions' : 'workspace'
-          const sessions = Array.isArray(entry?.sessions)
-            ? [...new Set(entry.sessions.map(String).filter((id) => id !== ''))]
-            : []
-          selection.push({
-            path: resolvedPath,
-            title: workspace?.title ?? path.basename(resolvedPath),
-            mode,
-            sessions: mode === 'sessions' ? sessions : [],
-          })
-          if (mode === 'workspace') {
-            const file = path.join(resolvedPath, '.dsh', 'skills', name, 'SKILL.md')
+      const result = await withMutation(async () => {
+        const state = await readBindings()
+        const previous = originalName !== '' ? state.bindings[originalName] : state.bindings[name]
+        if (originalName !== name) {
+          const taken =
+            state.bindings[name] !== undefined ||
+            (await collectSkills(ctx)).some((skill) => skill.name === name)
+          if (taken) throw httpError(409, 'duplicate-skill')
+        }
+
+        const files = []
+        const selection = []
+        if (scope === 'global') {
+          const file = path.join(resolveDshHome(), 'skills', name, 'SKILL.md')
+          await fs.mkdir(path.dirname(file), { recursive: true })
+          await fs.writeFile(file, text, 'utf8')
+          files.push(file)
+        } else {
+          const requested = Array.isArray(body.workspaces) ? body.workspaces : []
+          for (const entry of requested) {
+            const workspacePath = String(entry?.path ?? '').trim()
+            if (workspacePath === '') continue
+            const workspace = knownWorkspace.get(canonicalKey(workspacePath))
+            if (workspace === undefined) throw httpError(400, 'workspace-unknown')
+            const mode = entry?.mode === 'sessions' ? 'sessions' : 'workspace'
+            const sessions = Array.isArray(entry?.sessions)
+              ? [...new Set(entry.sessions.map(String).filter((id) => id !== ''))]
+              : []
+            if (mode === 'sessions' && sessions.length === 0) throw httpError(400, 'session-required')
+            selection.push({
+              path: workspace.path,
+              title: workspace.title,
+              // The provider discovers project skills from the nearest `.git`
+              // root, not necessarily from the workspace directory itself.
+              root: workspace.projectRoot ?? workspace.path,
+              mode,
+              sessions: mode === 'sessions' ? sessions : [],
+            })
+            if (mode === 'workspace') {
+              const file = path.join(workspace.projectRoot ?? workspace.path, '.dsh', 'skills', name, 'SKILL.md')
+              await fs.mkdir(path.dirname(file), { recursive: true })
+              await fs.writeFile(file, text, 'utf8')
+              files.push(file)
+            }
+          }
+          if (selection.length === 0) throw httpError(400, 'workspace-required')
+          if (selection.some((entry) => entry.mode === 'sessions')) {
+            const file = path.join(managedSkillDir(name), 'SKILL.md')
             await fs.mkdir(path.dirname(file), { recursive: true })
-            await fs.writeFile(file, renderSkillFile({ name, description, whenToUse, content }), 'utf8')
+            await fs.writeFile(file, text, 'utf8')
             files.push(file)
           }
         }
-        if (selection.length === 0) {
-          sendJson(request, response, 400, { error: 'workspace-required' })
-          return
-        }
-        const needsManaged = selection.some((entry) => entry.mode === 'sessions')
-        if (needsManaged) {
-          const file = path.join(managedSkillDir(name), 'SKILL.md')
-          await fs.mkdir(path.dirname(file), { recursive: true })
-          await fs.writeFile(file, renderSkillFile({ name, description, whenToUse, content }), 'utf8')
-          files.push(file)
-        }
-      }
 
-      // Remove files this plugin wrote for the previous revision of the skill.
-      const stale = (previous?.files ?? []).filter(
-        (file) => !files.some((next) => canonicalKey(next) === canonicalKey(file)),
-      )
-      if (stale.length > 0) await removeFiles(stale)
-      if (originalName !== '' && originalName !== name) {
-        delete state.bindings[originalName]
-      }
-      const binding = {
-        scope,
-        workspaces: selection,
-        sessions: [...new Set(selection.flatMap((entry) => entry.sessions ?? []))],
-        managed: files.some((file) => canonicalKey(file).startsWith(canonicalKey(storeDir()) + path.sep)),
-        files,
-        updatedAt: Date.now(),
-      }
-      if (scope === 'global' && previous !== undefined) {
-        const managedOld = path.join(managedSkillDir(name), 'SKILL.md')
-        await removeFiles([managedOld])
-      }
-      state.bindings[name] = binding
-      await writeBindings(state)
+        // Remove the files this plugin wrote for the previous revision only.
+        const stale = (previous?.files ?? []).filter(
+          (file) => !files.some((next) => canonicalKey(next) === canonicalKey(file)),
+        )
+        await removeFiles(stale)
+        if (originalName !== '' && originalName !== name) delete state.bindings[originalName]
+        state.bindings[name] = {
+          scope,
+          workspaces: selection,
+          sessions: [...new Set(selection.flatMap((entry) => entry.sessions ?? []))],
+          managed: files.some((file) => canonicalKey(file).startsWith(canonicalKey(managedRoot()) + path.sep)),
+          files,
+          updatedAt: Date.now(),
+        }
+        await writeBindings(state)
+        return { name, files }
+      })
+
       await refreshSkillCache(ctx)
       resyncSessionSections()
-      sendJson(request, response, 200, { name, files, skills: await collectSkills(ctx) })
+      sendJson(request, response, 200, { ...result, skills: await collectSkills(ctx) })
     } catch (error) {
-      logWarn(`skill save failed: ${error instanceof Error ? error.message : String(error)}`)
-      sendJson(request, response, 500, { error: error instanceof Error ? error.message : 'write-failed' })
+      const status = Number(error?.status) || 500
+      if (status >= 500) logWarn(`skill save failed: ${error instanceof Error ? error.message : String(error)}`)
+      sendJson(request, response, status, { error: error instanceof Error ? error.message : 'write-failed' })
     }
   }
 
@@ -1160,44 +1384,34 @@ export function apply(ctx) {
       return
     }
     const name = normalizeSkillName(body.name)
-    const explicitPath = typeof body.path === 'string' ? path.resolve(body.path) : ''
+    const explicitPath = typeof body.path === 'string' && body.path.trim() !== '' ? path.resolve(body.path) : ''
     try {
-      const state = await readBindings()
-      const binding = name !== '' ? state.bindings[name] : undefined
-      const targets = new Set()
-      if (explicitPath !== '') {
-        if (!isInsideAny(explicitPath, [...allowedRootsForSkills(), canonicalKey(storeDir())])) {
-          sendJson(request, response, 403, { error: 'path-outside-skill-roots' })
-          return
+      const removed = await withMutation(async () => {
+        const state = await readBindings()
+        const binding = name !== '' ? state.bindings[name] : undefined
+        const targets = new Set()
+        // Only the file the user actually confirmed is a candidate from the
+        // request; same-named skills in other roots stay untouched.
+        if (explicitPath !== '') {
+          if (!isSkillFileTarget(explicitPath, name)) throw httpError(400, 'invalid-delete-target')
+          if (!isInsideAny(explicitPath, removableRoots())) throw httpError(403, 'path-outside-skill-roots')
+          targets.add(explicitPath)
         }
-        targets.add(explicitPath)
-      }
-      for (const file of binding?.files ?? []) targets.add(file)
-      if (name !== '') {
-        const { roots, projectRoots } = allSkillRoots(ctx)
-        for (const entry of [...roots, ...projectRoots]) {
-          targets.add(path.join(entry.root, name, 'SKILL.md'))
-          targets.add(path.join(entry.root, `${name}.md`))
+        for (const file of binding?.files ?? []) targets.add(file)
+        if (name !== '') {
+          delete state.bindings[name]
+          await writeBindings(state)
         }
-        targets.add(path.join(managedSkillDir(name), 'SKILL.md'))
-        delete state.bindings[name]
-        await writeBindings(state)
-      }
-      const existing = []
-      for (const target of targets) {
-        try {
-          await fs.access(target)
-          existing.push(target)
-        } catch {
-          /* not present */
-        }
-      }
-      await removeFiles(existing)
+        await removeFiles([...targets])
+        return [...targets]
+      })
       await refreshSkillCache(ctx)
       resyncSessionSections()
-      sendJson(request, response, 200, { skills: await collectSkills(ctx) })
+      sendJson(request, response, 200, { removed, skills: await collectSkills(ctx) })
     } catch (error) {
-      sendJson(request, response, 500, { error: error instanceof Error ? error.message : 'delete-failed' })
+      const status = Number(error?.status) || 500
+      logWarn(`skill delete failed: ${error instanceof Error ? error.message : String(error)}`)
+      sendJson(request, response, status, { error: error instanceof Error ? error.message : 'delete-failed' })
     }
   }
 
@@ -1301,15 +1515,33 @@ export function apply(ctx) {
 
   const applyChildRestriction = (agent, rule) => {
     if (rule.allow === null || rule.allow.size === 0) return
+    const id = agent?.id ?? agent?.session?.id
+    if (typeof id === 'string' && restrictionDisposers.has(id)) return
     try {
       const tools = agent?.ctx?.get?.('tools', false) ?? agent?.ctx?.tools
       if (!tools || typeof tools.restrict !== 'function') return
       const known = new Set(collectToolNames(ctx))
       const allow = [...rule.allow].filter((name) => known.has(name) || name === TOOL_NAME)
       if (allow.length === 0) return
-      agent.ctx.effect(() => tools.restrict({ allow }))
+      const dispose = agent.ctx.effect(() => tools.restrict({ allow }))
+      if (typeof dispose === 'function' && typeof id === 'string') restrictionDisposers.set(id, dispose)
     } catch (error) {
       logWarn(`tool restriction failed: ${error instanceof Error ? error.message : String(error)}`)
+    }
+  }
+
+  const resyncChildRestrictions = () => {
+    const agentsService = useService(ctx, 'agents')
+    if (!agentsService || typeof agentsService.list !== 'function') return
+    let agents = []
+    try {
+      agents = agentsService.list() || []
+    } catch {
+      return
+    }
+    for (const agent of agents) {
+      const rule = childRules.get(agent?.id ?? agent?.session?.id)
+      if (rule !== undefined) applyChildRestriction(agent, rule)
     }
   }
 
@@ -1355,6 +1587,14 @@ export function apply(ctx) {
       }
     }
     sessionSections.clear()
+    for (const dispose of restrictionDisposers.values()) {
+      try {
+        dispose()
+      } catch {
+        /* ignore */
+      }
+    }
+    restrictionDisposers.clear()
     childRules.clear()
   })
 
@@ -1407,28 +1647,66 @@ export function apply(ctx) {
           }
         : undefined
 
-    const activation = await subagents.startActivation({
-      provider,
-      label: definition.displayName || definition.name,
-      request: {
-        prompt: [{ type: 'text', text: prompt }],
-        parent,
-        signal: exec.signal,
-        ...(args?.cwd === undefined ? {} : { cwd: String(args.cwd) }),
-        ...(agentOptions === undefined ? {} : { agentOptions }),
-        ...(definition.maxDepth === undefined ? {} : { maxDepth: definition.maxDepth }),
-      },
-      signal: exec.signal,
-      delivery: 'parent',
-    })
-
+    const label = definition.displayName || definition.name
     const allow = definition.tools === null || definition.tools === undefined ? null : new Set(definition.tools)
-    childRules.set(activation.childId, { allow, label: definition.displayName || definition.name })
-    const release = () => childRules.delete(activation.childId)
+    const rule = { allow, label }
+    // Reserve the child identity and register its rule BEFORE the activation:
+    // `agent/created` listeners are awaited before creation resolves, so a rule
+    // written after `startActivation` returns would never reach the child's
+    // model-facing tool set. The rule also outlives the activation because local
+    // spawn/fork children stay resumable for later messages.
+    const childId = randomUUID()
+    childRules.set(childId, rule)
+    await persistChildRule(childId, rule)
+
+    const resolvedDepth =
+      typeof subagents.resolveMaxDepth === 'function'
+        ? subagents.resolveMaxDepth(definition.maxDepth ?? 1)
+        : (definition.maxDepth ?? 1)
+
+    let activation
     try {
-      activation.result.then(release, release)
+      activation = await subagents.startActivation({
+        provider,
+        label,
+        childId,
+        request: {
+          prompt: [{ type: 'text', text: prompt }],
+          parent,
+          signal: exec.signal,
+          ...(args?.cwd === undefined ? {} : { cwd: String(args.cwd) }),
+          ...(agentOptions === undefined ? {} : { agentOptions }),
+          ...(resolvedDepth === undefined ? {} : { maxDepth: resolvedDepth }),
+        },
+        signal: exec.signal,
+        delivery: 'parent',
+      })
+    } catch (error) {
+      await dropChildRule(childId)
+      throw error
+    }
+
+    if (activation.childId !== childId) {
+      childRules.delete(childId)
+      childRules.set(activation.childId, rule)
+      try {
+        const children = await readChildRules()
+        delete children[childId]
+        children[activation.childId] = { allow: allow === null ? null : [...allow], label, at: Date.now() }
+        await writeChildRules(children)
+      } catch {
+        /* the in-memory rule still covers this process */
+      }
+    }
+
+    // Backstop for a backend that publishes the child before the listener sees
+    // it; the listener normally installed the restriction already.
+    try {
+      const agentsService = useService(ctx, 'agents')
+      const childAgent = agentsService?.get?.(activation.childId)
+      if (childAgent) applyChildRestriction(childAgent, childRules.get(activation.childId) ?? rule)
     } catch {
-      /* result promise is required by the contract but stay defensive */
+      /* not fatal: the guard still denies out-of-list tools */
     }
 
     return activation.childId
@@ -1520,6 +1798,8 @@ export function apply(ctx) {
 
   void (async () => {
     currentAgents = await readAgentStore()
+    await loadChildRules()
+    resyncChildRestrictions()
     try {
       await refreshSkillCache(ctx)
     } catch {

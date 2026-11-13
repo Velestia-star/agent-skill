@@ -25,6 +25,7 @@ window.__ModuleLoader__.load({
       'panel.skills.hint': '子智能体启动前会先读这些指令',
       'panel.callhint': '调用方式',
       'panel.copyHint': '复制',
+      'panel.copyTemplate': 'delegate_agent(agent: "<名称>", prompt: "…")',
       'panel.copied': '已复制',
       'panel.refresh': '刷新',
       'panel.loading': '正在读取…',
@@ -112,6 +113,7 @@ window.__ModuleLoader__.load({
       'skill.field.workspacesEmpty': '左侧栏还没有工作区。',
       'skill.field.content': '指令内容',
       'skill.field.contentHint': '正文，模型按它执行',
+      'skill.field.contentSize': '{n} / 49152 字节',
       'skill.field.contentPlaceholder': '## 步骤\n1. 先读 diff\n2. 再找回归风险\n3. 输出必须修的问题清单',
       'skill.workspace.nextNew': '下一个新对话也能用（推荐）',
       'skill.workspace.nextNewHint': '写进该工作区的 .dsh/skills，之后的对话都带上。',
@@ -153,6 +155,11 @@ window.__ModuleLoader__.load({
       'error.offline': 'Host 没有响应。',
       'error.session-required': '至少选一个对话，或改成「下一个新对话」。',
       'error.duplicate-skill': '同名技能已存在。',
+      'error.skill-too-large': '技能正文超过 48 KiB，写进去模型也会读不到，请精简。',
+      'error.description-too-long': '描述太长（上限 4000 字节）。',
+      'error.when-to-use-too-long': '适用场景太长（上限 4000 字节）。',
+      'error.workspace-unknown': '这个工作区不在注册表里，刷新后重选。',
+      'error.invalid-delete-target': '删除目标不是技能文件。',
       'toast.savedAgent': '子智能体已保存',
       'toast.deletedAgent': '子智能体已删除',
       'toast.savedSkill': '技能已保存',
@@ -168,6 +175,7 @@ window.__ModuleLoader__.load({
       'panel.skills.hint': 'Read before a subagent starts',
       'panel.callhint': 'Call',
       'panel.copyHint': 'Copy',
+      'panel.copyTemplate': 'delegate_agent(agent: "<name>", prompt: "…")',
       'panel.copied': 'Copied',
       'panel.refresh': 'Refresh',
       'panel.loading': 'Loading…',
@@ -255,6 +263,7 @@ window.__ModuleLoader__.load({
       'skill.field.workspacesEmpty': 'No workspace in the sidebar yet.',
       'skill.field.content': 'Instructions',
       'skill.field.contentHint': 'The body the model follows',
+      'skill.field.contentSize': '{n} / 49152 bytes',
       'skill.field.contentPlaceholder': '## Steps\n1. Read the diff\n2. Look for regressions\n3. List must-fix items',
       'skill.workspace.nextNew': 'Also in the next new conversation (recommended)',
       'skill.workspace.nextNewHint': 'Writes into that workspace’s .dsh/skills.',
@@ -296,6 +305,11 @@ window.__ModuleLoader__.load({
       'error.offline': 'The Host did not respond.',
       'error.session-required': 'Pick at least one conversation, or switch to the next new conversation.',
       'error.duplicate-skill': 'A skill with that name already exists.',
+      'error.skill-too-large': 'The body exceeds 48 KiB; the model would stop reading it. Trim it.',
+      'error.description-too-long': 'The description is too long (4000 bytes max).',
+      'error.when-to-use-too-long': 'When to use is too long (4000 bytes max).',
+      'error.workspace-unknown': 'That workspace is no longer registered; refresh and pick again.',
+      'error.invalid-delete-target': 'The delete target is not a skill file.',
       'toast.savedAgent': 'Subagent saved',
       'toast.deletedAgent': 'Subagent deleted',
       'toast.savedSkill': 'Skill saved',
@@ -356,6 +370,15 @@ window.__ModuleLoader__.load({
       const limit = typeof max === 'number' ? max : 48
       if (value.length <= limit) return value
       return '…' + value.slice(value.length - limit + 1)
+    }
+
+    function byteLength(value) {
+      const text = String(value ?? '')
+      try {
+        return new TextEncoder().encode(text).length
+      } catch {
+        return text.length
+      }
     }
 
     function describeError(error) {
@@ -665,7 +688,8 @@ window.__ModuleLoader__.load({
       const [state, setState] = useState({ status: 'loading', data: null, error: null })
       const abortRef = useRef(null)
 
-      const load = useCallback(async () => {
+      const load = useCallback(async (options = {}) => {
+        const fresh = options && options.fresh === true
         try {
           abortRef.current?.abort()
         } catch {
@@ -679,7 +703,7 @@ window.__ModuleLoader__.load({
           error: null,
         }))
         try {
-          const response = await fetch(API_STATE, {
+          const response = await fetch(fresh ? `${API_STATE}?fresh=1` : API_STATE, {
             headers: { accept: 'application/json' },
             signal: controller ? controller.signal : undefined,
           })
@@ -1057,6 +1081,8 @@ window.__ModuleLoader__.load({
         rows.push({
           path: workspace.path,
           title: workspace.title,
+          // The provider discovers project skills from the nearest `.git` root.
+          projectRoot: existing?.root ?? workspace.projectRoot ?? workspace.path,
           included: existing !== undefined,
           mode: existing?.mode === 'sessions' ? 'sessions' : 'workspace',
           sessions: existing?.sessions ? existing.sessions.slice() : [],
@@ -1120,7 +1146,10 @@ window.__ModuleLoader__.load({
               h(Check, {
                 checked: row.included,
                 label: row.title || row.path,
-                detail: shortPath(row.path, 42),
+                detail:
+                  row.projectRoot && !samePath(row.projectRoot, row.path)
+                    ? `${shortPath(row.path, 26)} → ${shortPath(row.projectRoot, 26)}`
+                    : shortPath(row.path, 42),
                 onChange: (checked) =>
                   patchRow(index, {
                     included: checked,
@@ -1236,7 +1265,8 @@ window.__ModuleLoader__.load({
         }
         const list = []
         for (const row of draft.workspaces.filter((entry) => entry.included)) {
-          if (row.mode === 'workspace') list.push(`${row.path}/.dsh/skills/${name}/SKILL.md`)
+          const root = row.projectRoot || row.path
+          if (row.mode === 'workspace') list.push(`${root}/.dsh/skills/${name}/SKILL.md`)
           else list.push(t('skill.workspace.managed'))
         }
         return list
@@ -1321,6 +1351,11 @@ window.__ModuleLoader__.load({
               placeholder: t('skill.field.contentPlaceholder'),
               onChange: (value) => set({ content: value }),
             }),
+            h(
+              'div',
+              { className: classNames('asa-dim', byteLength(draft.content) > 48 * 1024 ? 'asa-warn' : '') },
+              t('skill.field.contentSize', { n: byteLength(draft.content) }),
+            ),
           ),
         ),
 
@@ -1338,7 +1373,7 @@ window.__ModuleLoader__.load({
     function AgentCard(props) {
       const { agent, data, onEdit, onDelete, confirm, onConfirm, onCancelConfirm, busy } = props
       const skills = data.skills || []
-      const chips = agent.skills.map((name) => ({
+      const chips = (agent.skills || []).map((name) => ({
         key: name,
         label: skills.some((skill) => skill.name === name) ? name : `${name} ⚠`,
         tone: skills.some((skill) => skill.name === name) ? undefined : 'warn',
@@ -1561,11 +1596,11 @@ window.__ModuleLoader__.load({
       )
 
       const refresh = useCallback(async () => {
-        await host.reload()
+        await host.reload({ fresh: true })
       }, [host])
 
       const copyCallTemplate = useCallback(async () => {
-        const template = 'delegate_agent(agent: "<名称>", prompt: "<完整任务>")'
+        const template = t('panel.copyTemplate')
         try {
           if (navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
             await navigator.clipboard.writeText(template)
@@ -1689,11 +1724,7 @@ window.__ModuleLoader__.load({
               onClick: copyCallTemplate,
             },
             h('span', { className: 'asa-callhint-label' }, t('panel.callhint')),
-            h(
-              'code',
-              { className: 'asa-mono' },
-              'delegate_agent(agent: "<名称>", prompt: "…")',
-            ),
+            h('code', { className: 'asa-mono' }, t('panel.copyTemplate')),
             icon('copy', 12),
           ),
           h(Button, {
