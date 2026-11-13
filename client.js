@@ -1969,7 +1969,10 @@ window.__ModuleLoader__.load({
 .asa-btn:disabled { opacity:.55; cursor:not-allowed; }
 .asa-btn-wide { flex:1; }
 .asa-btn[data-tone="primary"] { background:var(--dsw-alias-brand-primary,#3b6ef5);
-  border-color:var(--dsw-alias-brand-primary,#3b6ef5); color:#fff; }
+  border-color:var(--dsw-alias-brand-primary,#3b6ef5);
+  /* The dark theme's brand accent is near-white, so the label must be the
+     inverted surface colour rather than a hard-coded white. */
+  color:var(--dsw-alias-bg-base,#fff); font-weight:600; }
 .asa-btn[data-tone="primary"]:hover:not(:disabled) { filter:brightness(1.06); }
 .asa-btn[data-tone="danger"] { color:var(--dsw-alias-state-error-primary,#c0392b);
   border-color:var(--dsw-alias-state-error-primary,#c0392b); background:transparent; }
