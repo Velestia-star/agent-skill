@@ -9,6 +9,8 @@ DeepSeek Harness 的侧栏插件：自己造**子智能体**和**技能**，然�
 - **子智能体（左）**——一个模型可以派人干活的具名工人：模型服务、思考强度、启动方式（`spawn` 全新对话 / `fork` 继承父对话）、工具清单、绑定的技能。
 - **技能（右）**——一份普通的 `SKILL.md` 指令包，带一段模型用来判断触发的描述：可以放全局、按工作区，甚至按单个对话生效。
 
+两个列表都能拖动排序：抓住卡片左侧的六点手柄，上下拖动时卡片之间会撑开一个虚线空位，松手就插到那里；顺序写进插件存储，刷新或重启后保持。
+
 ## 依赖
 
 - 带 Web UI 的 DeepSeek Harness（面板是 Client slot 入口）。
@@ -80,11 +82,11 @@ dsh plugin install /absolute/path/to/dsh-agent-skill
 
 | 数据 | 位置 |
 |---|---|
-| 子智能体定义 | `<dshHome>/agent-skill/agents.json` |
-| 技能绑定 | `<dshHome>/agent-skill/skills.json` |
+| 子智能体定义 | `<dshHome>/agent-skill/agents.json`（每行带拖拽用的 `order`） |
+| 技能绑定 | `<dshHome>/agent-skill/skills.json`（同时保存拖拽 `order` 映射） |
 | 按对话生效的技能正文 | `<dshHome>/agent-skill/managed-skills/<技能名>/SKILL.md` |
 | 全局技能 | `<dshHome>/skills/<技能名>/SKILL.md`（以及 `<agentsHome>/skills`） |
-| 项目技能 | `<工作区>/.dsh/skills/<技能名>/SKILL.md` |
+| 项目技能 | `<项目根>/.dsh/skills/<技能名>/SKILL.md`（最近的 `.git` 祖先） |
 
 这些根目录是 `@deepseek-ai/dsh-skill-filesystem` 扫描全局与项目来源时用的位置（它自己的 custom / bundled 根不在管理范围内），所以写在这里的技能不需要第二个 provider 就能进模型目录。面板也会列出插件之外创建的技能。
 
@@ -99,8 +101,10 @@ dsh plugin install /absolute/path/to/dsh-agent-skill
 | `GET` | `/api/dsh-agent-skill/skill?path=` | 读取托管根目录内的一份 `SKILL.md` |
 | `POST` | `/api/dsh-agent-skill/agents/save` | 新建或更新子智能体 |
 | `POST` | `/api/dsh-agent-skill/agents/delete` | 删除子智能体 |
+| `POST` | `/api/dsh-agent-skill/agents/reorder` | 保存拖拽顺序（`{ ids }`，完整排列） |
 | `POST` | `/api/dsh-agent-skill/skills/save` | 写入技能及其绑定 |
 | `POST` | `/api/dsh-agent-skill/skills/delete` | 删除技能与插件为它写过的文件 |
+| `POST` | `/api/dsh-agent-skill/skills/reorder` | 保存拖拽顺序（`{ names }`，完整排列） |
 
 ## 模型侧工具
 

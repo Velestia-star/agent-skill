@@ -24,8 +24,10 @@ const ROUTES = {
   skill: '/api/dsh-agent-skill/skill',
   agentSave: '/api/dsh-agent-skill/agents/save',
   agentDelete: '/api/dsh-agent-skill/agents/delete',
+  agentReorder: '/api/dsh-agent-skill/agents/reorder',
   skillSave: '/api/dsh-agent-skill/skills/save',
   skillDelete: '/api/dsh-agent-skill/skills/delete',
+  skillReorder: '/api/dsh-agent-skill/skills/reorder',
 }
 
 /** Wait for the plugin's asynchronous startup pass. */
@@ -539,6 +541,7 @@ test('renaming a skill moves the directory and drops the old one', async () => {
   })
   await assert.rejects(stat(oldFile))
   await stat(path.join(root, 'dsh-home', 'skills', 'after-name', 'SKILL.md'))
+  await post(harness.state, ROUTES.skillDelete, { name: 'after-name' })
 })
 
 test('a project skill targets the nearest .git root the provider scans', async () => {
@@ -697,6 +700,91 @@ test('delegation defers the depth policy to the host resolver', async () => {
     assert.equal(harness.state.activation.request.maxDepth, 0)
   } finally {
     harness.services.subagents.resolveMaxDepth = original
+  }
+})
+
+test('agents keep the order the user dragged them into', async () => {
+  const state = await call(harness.state, ROUTES.state)
+  const existingIds = state.json.agents.map((agent) => agent.id)
+  const created = []
+  for (const name of ['ord-a', 'ord-b', 'ord-c']) {
+    const saved = await post(harness.state, ROUTES.agentSave, { name })
+    assert.equal(saved.status, 200)
+    created.push(saved.json.agent.id)
+  }
+  const allIds = [...existingIds, ...created]
+  const reversed = [...allIds].reverse()
+  const reordered = await post(harness.state, ROUTES.agentReorder, { ids: reversed })
+  assert.equal(reordered.status, 200)
+  assert.deepEqual(reordered.json.agents.map((agent) => agent.id), reversed)
+  assert.deepEqual(reordered.json.agents.map((agent) => agent.order), reversed.map((_, index) => index))
+
+  const after = await call(harness.state, ROUTES.state)
+  assert.deepEqual(after.json.agents.map((agent) => agent.id), reversed)
+
+  const bad = await post(harness.state, ROUTES.agentReorder, { ids: [reversed[0]] })
+  assert.equal(bad.status, 400)
+  assert.equal(bad.json.error, 'invalid-order')
+
+  // A new card lands at the bottom of the current order.
+  const fourth = await post(harness.state, ROUTES.agentSave, { name: 'ord-d' })
+  assert.equal(fourth.status, 200)
+  const settled = await call(harness.state, ROUTES.state)
+  assert.equal(settled.json.agents[settled.json.agents.length - 1].name, 'ord-d')
+
+  for (const id of [...created, fourth.json.agent.id]) {
+    await post(harness.state, ROUTES.agentDelete, { id })
+  }
+})
+
+test('skills keep the order the user dragged them into', async () => {
+  const before = await call(harness.state, ROUTES.state)
+  assert.deepEqual(before.json.skills, [], 'this test starts from an empty skill list')
+  for (const name of ['ord-skill-a', 'ord-skill-b', 'ord-skill-c']) {
+    const saved = await post(harness.state, ROUTES.skillSave, {
+      name,
+      description: `${name}.`,
+      content: 'Body.',
+      scope: 'global',
+    })
+    assert.equal(saved.status, 200)
+  }
+
+  const reordered = await post(harness.state, ROUTES.skillReorder, {
+    names: ['ord-skill-c', 'ord-skill-a', 'ord-skill-b'],
+  })
+  assert.equal(reordered.status, 200)
+  assert.deepEqual(
+    reordered.json.skills.map((skill) => skill.name),
+    ['ord-skill-c', 'ord-skill-a', 'ord-skill-b'],
+  )
+
+  const after = await call(harness.state, ROUTES.state)
+  assert.deepEqual(
+    after.json.skills.map((skill) => skill.name),
+    ['ord-skill-c', 'ord-skill-a', 'ord-skill-b'],
+  )
+
+  // Renaming keeps the card where it sits.
+  await post(harness.state, ROUTES.skillSave, {
+    originalName: 'ord-skill-c',
+    name: 'ord-skill-cc',
+    description: 'Renamed.',
+    content: 'Body.',
+    scope: 'global',
+  })
+  const renamed = await call(harness.state, ROUTES.state)
+  assert.deepEqual(
+    renamed.json.skills.map((skill) => skill.name),
+    ['ord-skill-cc', 'ord-skill-a', 'ord-skill-b'],
+  )
+
+  const bad = await post(harness.state, ROUTES.skillReorder, { names: ['ord-skill-cc'] })
+  assert.equal(bad.status, 400)
+  assert.equal(bad.json.error, 'invalid-order')
+
+  for (const name of ['ord-skill-cc', 'ord-skill-a', 'ord-skill-b']) {
+    await post(harness.state, ROUTES.skillDelete, { name })
   }
 })
 

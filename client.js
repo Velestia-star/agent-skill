@@ -11,8 +11,10 @@ window.__ModuleLoader__.load({
     const API_MODEL = '/api/dsh-agent-skill/model'
     const API_AGENT_SAVE = '/api/dsh-agent-skill/agents/save'
     const API_AGENT_DELETE = '/api/dsh-agent-skill/agents/delete'
+    const API_AGENT_REORDER = '/api/dsh-agent-skill/agents/reorder'
     const API_SKILL_SAVE = '/api/dsh-agent-skill/skills/save'
     const API_SKILL_DELETE = '/api/dsh-agent-skill/skills/delete'
+    const API_SKILL_REORDER = '/api/dsh-agent-skill/skills/reorder'
 
     /* ------------------------------------------------------------ locale */
 
@@ -26,6 +28,8 @@ window.__ModuleLoader__.load({
       'panel.callhint': '调用方式',
       'panel.copyHint': '复制',
       'panel.copyTemplate': 'delegate_agent(agent: "<名称>", prompt: "…")',
+      'panel.dragHint': '拖动排序',
+      'panel.moving': '拖动中…',
       'panel.copied': '已复制',
       'panel.refresh': '刷新',
       'panel.loading': '正在读取…',
@@ -160,6 +164,8 @@ window.__ModuleLoader__.load({
       'error.when-to-use-too-long': '适用场景太长（上限 4000 字节）。',
       'error.workspace-unknown': '这个工作区不在注册表里，刷新后重选。',
       'error.invalid-delete-target': '删除目标不是技能文件。',
+      'error.invalid-order': '顺序数据不对，刷新后重试。',
+      'error.reorder-failed': '排序保存失败。',
       'toast.savedAgent': '子智能体已保存',
       'toast.deletedAgent': '子智能体已删除',
       'toast.savedSkill': '技能已保存',
@@ -176,6 +182,8 @@ window.__ModuleLoader__.load({
       'panel.callhint': 'Call',
       'panel.copyHint': 'Copy',
       'panel.copyTemplate': 'delegate_agent(agent: "<name>", prompt: "…")',
+      'panel.dragHint': 'Drag to reorder',
+      'panel.moving': 'Moving…',
       'panel.copied': 'Copied',
       'panel.refresh': 'Refresh',
       'panel.loading': 'Loading…',
@@ -310,6 +318,8 @@ window.__ModuleLoader__.load({
       'error.when-to-use-too-long': 'When to use is too long (4000 bytes max).',
       'error.workspace-unknown': 'That workspace is no longer registered; refresh and pick again.',
       'error.invalid-delete-target': 'The delete target is not a skill file.',
+      'error.invalid-order': 'The order payload was rejected; refresh and retry.',
+      'error.reorder-failed': 'Could not save the new order.',
       'toast.savedAgent': 'Subagent saved',
       'toast.deletedAgent': 'Subagent deleted',
       'toast.savedSkill': 'Skill saved',
@@ -457,6 +467,14 @@ window.__ModuleLoader__.load({
           h('path', { key: 'b', d: 'M8 8h7M8 12h7' }),
         ],
         dot: [h('circle', { key: 'a', cx: '12', cy: '12', r: '4', fill: 'currentColor', stroke: 'none' })],
+        grip: [
+          h('circle', { key: 'a', cx: '9', cy: '7', r: '1.2', fill: 'currentColor', stroke: 'none' }),
+          h('circle', { key: 'b', cx: '15', cy: '7', r: '1.2', fill: 'currentColor', stroke: 'none' }),
+          h('circle', { key: 'c', cx: '9', cy: '12', r: '1.2', fill: 'currentColor', stroke: 'none' }),
+          h('circle', { key: 'd', cx: '15', cy: '12', r: '1.2', fill: 'currentColor', stroke: 'none' }),
+          h('circle', { key: 'e', cx: '9', cy: '17', r: '1.2', fill: 'currentColor', stroke: 'none' }),
+          h('circle', { key: 'f', cx: '15', cy: '17', r: '1.2', fill: 'currentColor', stroke: 'none' }),
+        ],
       }
       return h('svg', common, paths[name] ?? paths.dot)
     }
@@ -727,7 +745,16 @@ window.__ModuleLoader__.load({
         }
       }, [load])
 
-      return { ...state, reload: load }
+      const setData = useCallback((updater) => {
+        setState((previous) => {
+          if (!previous.data) return previous
+          const data = typeof updater === 'function' ? updater(previous.data) : updater
+          if (data === previous.data) return previous
+          return { ...previous, data }
+        })
+      }, [])
+
+      return { ...state, reload: load, setData }
     }
 
     function useModelEfforts(provider, model) {
@@ -1370,8 +1397,25 @@ window.__ModuleLoader__.load({
 
     /* ----------------------------------------------------------------- cards */
 
+    function DragGrip(props) {
+      return h(
+        'span',
+        {
+          className: 'asa-grip',
+          draggable: true,
+          title: t('panel.dragHint'),
+          'aria-label': t('panel.dragHint'),
+          role: 'button',
+          tabIndex: -1,
+          onDragStart: props.onDragStart,
+          onDragEnd: props.onDragEnd,
+        },
+        icon('grip', 12),
+      )
+    }
+
     function AgentCard(props) {
-      const { agent, data, onEdit, onDelete, confirm, onConfirm, onCancelConfirm, busy } = props
+      const { agent, data, onEdit, onDelete, confirm, onConfirm, onCancelConfirm, busy, drag } = props
       const skills = data.skills || []
       const chips = (agent.skills || []).map((name) => ({
         key: name,
@@ -1390,10 +1434,15 @@ window.__ModuleLoader__.load({
 
       return h(
         'div',
-        { className: 'asa-card' },
+        {
+          className: 'asa-card',
+          'data-dnd-card': 'true',
+          'data-dragging': drag?.dragging ? 'true' : 'false',
+        },
         h(
           'div',
           { className: 'asa-card-head' },
+          h(DragGrip, { onDragStart: drag?.onDragStart, onDragEnd: drag?.onDragEnd }),
           h('span', { className: 'asa-card-title asa-mono' }, agent.name),
           agent.displayName && agent.displayName !== agent.name
             ? h('span', { className: 'asa-card-sub' }, agent.displayName)
@@ -1424,7 +1473,7 @@ window.__ModuleLoader__.load({
     }
 
     function SkillCard(props) {
-      const { skill, data, onEdit, onDelete, confirm, onConfirm, onCancelConfirm, busy } = props
+      const { skill, data, onEdit, onDelete, confirm, onConfirm, onCancelConfirm, busy, drag } = props
       const usedBy = (data.agents || []).filter((agent) => (agent.skills || []).includes(skill.name)).length
       const binding = skill.binding
       const scopeBadge =
@@ -1444,10 +1493,15 @@ window.__ModuleLoader__.load({
 
       return h(
         'div',
-        { className: 'asa-card' },
+        {
+          className: 'asa-card',
+          'data-dnd-card': 'true',
+          'data-dragging': drag?.dragging ? 'true' : 'false',
+        },
         h(
           'div',
           { className: 'asa-card-head' },
+          h(DragGrip, { onDragStart: drag?.onDragStart, onDragEnd: drag?.onDragEnd }),
           h('span', { className: 'asa-card-title asa-mono' }, skill.name),
           h(Badge, { tone: skill.scope === 'global' ? undefined : 'brand' }, scopeBadge),
           h(Badge, null, skill.source === 'managed' ? t('skill.source.managed') : t('skill.source.filesystem')),
@@ -1610,6 +1664,139 @@ window.__ModuleLoader__.load({
           showToast(t('error.request-failed'))
         }
       }, [showToast])
+
+      /* ---------------------------------------------------------- drag & drop */
+
+      const startDrag = useCallback((kind, key, event) => {
+        const card = event.currentTarget && event.currentTarget.closest
+          ? event.currentTarget.closest('[data-dnd-card]')
+          : null
+        const rect = card ? card.getBoundingClientRect() : null
+        try {
+          event.dataTransfer.effectAllowed = 'move'
+          event.dataTransfer.setData('text/plain', `${kind}:${key}`)
+          if (card && rect) {
+            event.dataTransfer.setDragImage(card, Math.min(28, Math.round(rect.width / 2)), 16)
+          }
+        } catch {
+          /* the state below still drives the gap preview */
+        }
+        setDrag({ kind, key, height: rect ? Math.round(rect.height) : 74, over: null })
+      }, [])
+
+      const endDrag = useCallback(() => setDrag(null), [])
+
+      const dragOver = useCallback((kind, event) => {
+        if (drag === null || drag.kind !== kind) return
+        event.preventDefault()
+        try {
+          event.dataTransfer.dropEffect = 'move'
+        } catch {
+          /* ignore */
+        }
+        const container = event.currentTarget
+        const cards = Array.from(container.querySelectorAll('[data-dnd-card]')).filter(
+          (node) => node.getAttribute('data-dragging') !== 'true',
+        )
+        let over = cards.length
+        for (let index = 0; index < cards.length; index += 1) {
+          const rect = cards[index].getBoundingClientRect()
+          if (event.clientY < rect.top + rect.height / 2) {
+            over = index
+            break
+          }
+        }
+        // Edge autoscroll keeps long lists usable while dragging.
+        const bounds = container.getBoundingClientRect()
+        if (event.clientY - bounds.top < 44) container.scrollTop -= 14
+        else if (bounds.bottom - event.clientY < 44) container.scrollTop += 14
+        setDrag((previous) =>
+          previous === null || previous.over === over ? previous : { ...previous, over },
+        )
+      }, [drag])
+
+      const dragLeave = useCallback((event) => {
+        if (event.currentTarget && event.currentTarget.contains(event.relatedTarget)) return
+        setDrag((previous) => (previous === null ? previous : { ...previous, over: null }))
+      }, [])
+
+      const dropOn = useCallback(async (kind, event) => {
+        if (drag === null || drag.kind !== kind) return
+        event.preventDefault()
+        const over = drag.over
+        const key = drag.key
+        setDrag(null)
+        if (over === null || over === undefined || !data) return
+
+        const items = kind === 'agent' ? data.agents || [] : data.skills || []
+        const keyOf = kind === 'agent' ? (item) => item.id : (item) => item.name
+        const from = items.findIndex((item) => keyOf(item) === key)
+        if (from < 0) return
+        const rest = items.filter((item, index) => index !== from)
+        const insert = Math.max(0, Math.min(over, rest.length))
+        const next = [...rest.slice(0, insert), items[from], ...rest.slice(insert)]
+        if (next.every((item, index) => item === items[index])) return
+
+        host.setData(
+          kind === 'agent'
+            ? (previous) => (previous ? { ...previous, agents: next } : previous)
+            : (previous) => (previous ? { ...previous, skills: next } : previous),
+        )
+
+        try {
+          if (kind === 'agent') {
+            const response = await postJson(API_AGENT_REORDER, {
+              ids: next.map((item) => item.id),
+            })
+            if (Array.isArray(response.agents)) {
+              host.setData((previous) => (previous ? { ...previous, agents: response.agents } : previous))
+            }
+          } else {
+            const response = await postJson(API_SKILL_REORDER, {
+              names: next.map((item) => item.name),
+            })
+            if (Array.isArray(response.skills)) {
+              host.setData((previous) => (previous ? { ...previous, skills: response.skills } : previous))
+            }
+          }
+        } catch (error) {
+          showToast(describeError(error))
+          await host.reload()
+        }
+      }, [data, drag, host, showToast])
+
+      const sortableItems = (kind, items, keyOf, renderItem) => {
+        const active = drag !== null && drag.kind === kind ? drag : null
+        const nodes = []
+        let seen = 0
+        for (const item of items) {
+          const key = keyOf(item)
+          const isActive = active !== null && key === active.key
+          if (!isActive && active !== null && active.over === seen) {
+            nodes.push(
+              h('div', {
+                key: `gap-${kind}-${seen}`,
+                className: 'asa-drop-gap',
+                style: { height: `${active.height}px` },
+                'aria-hidden': 'true',
+              }),
+            )
+          }
+          if (!isActive) seen += 1
+          nodes.push(renderItem(item, { dragging: isActive }))
+        }
+        if (active !== null && active.over === seen) {
+          nodes.push(
+            h('div', {
+              key: `gap-${kind}-end`,
+              className: 'asa-drop-gap',
+              style: { height: `${active.height}px` },
+              'aria-hidden': 'true',
+            }),
+          )
+        }
+        return nodes
+      }
 
       const saveAgent = useCallback(async () => {
         if (!agentEditor) return
@@ -1804,7 +1991,14 @@ window.__ModuleLoader__.load({
                 })
               : h(
                   'div',
-                  { className: 'asa-list' },
+                  {
+                    className: 'asa-list',
+                    onDragOver: (event) => dragOver('agent', event),
+                    onDragLeave: dragLeave,
+                    onDrop: (event) => {
+                      void dropOn('agent', event)
+                    },
+                  },
                   agents.length === 0
                     ? h(
                         'div',
@@ -1818,7 +2012,7 @@ window.__ModuleLoader__.load({
                           onClick: () => setAgentEditor({ draft: emptyAgentDraft(), isNew: true }),
                         }),
                       )
-                    : agents.map((agent) =>
+                    : sortableItems('agent', agents, (agent) => agent.id, (agent, view) =>
                         h(AgentCard, {
                           key: agent.id,
                           agent,
@@ -1832,6 +2026,11 @@ window.__ModuleLoader__.load({
                           onDelete: () => setConfirm({ kind: 'agent', id: agent.id }),
                           onConfirm: () => deleteAgent(agent),
                           onCancelConfirm: () => setConfirm(null),
+                          drag: {
+                            dragging: view.dragging,
+                            onDragStart: (event) => startDrag('agent', agent.id, event),
+                            onDragEnd: endDrag,
+                          },
                         }),
                       ),
                 ),
@@ -1863,7 +2062,14 @@ window.__ModuleLoader__.load({
                 })
               : h(
                   'div',
-                  { className: 'asa-list' },
+                  {
+                    className: 'asa-list',
+                    onDragOver: (event) => dragOver('skill', event),
+                    onDragLeave: dragLeave,
+                    onDrop: (event) => {
+                      void dropOn('skill', event)
+                    },
+                  },
                   skills.length === 0
                     ? h(
                         'div',
@@ -1878,7 +2084,7 @@ window.__ModuleLoader__.load({
                             setSkillEditor({ draft: skillDraftOf(undefined, data.workspaces || []), isNew: true }),
                         }),
                       )
-                    : skills.map((skill) =>
+                    : sortableItems('skill', skills, (skill) => skill.name, (skill, view) =>
                         h(SkillCard, {
                           key: skill.path || skill.name,
                           skill,
@@ -1892,6 +2098,11 @@ window.__ModuleLoader__.load({
                           onDelete: () => setConfirm({ kind: 'skill', name: skill.name }),
                           onConfirm: () => deleteSkill(skill),
                           onCancelConfirm: () => setConfirm(null),
+                          drag: {
+                            dragging: view.dragging,
+                            onDragStart: (event) => startDrag('skill', skill.name, event),
+                            onDragEnd: endDrag,
+                          },
                         }),
                       ),
                 ),
@@ -1990,6 +2201,15 @@ window.__ModuleLoader__.load({
 .asa-card { display:flex; flex-direction:column; gap:6px; padding:10px 11px; border-radius:10px;
   border:1px solid var(--dsw-alias-border-l1,#e4e4ea); background:var(--dsw-alias-bg-base,#fff); }
 .asa-card:hover { border-color:var(--dsw-alias-border-l2,#c9c9d2); }
+.asa-grip { display:inline-flex; align-items:center; justify-content:center; width:16px; height:20px; margin-left:-5px;
+  flex:none; border-radius:5px; color:var(--dsw-alias-label-secondary,#6b6b76); cursor:grab; opacity:.6; }
+.asa-grip:hover { opacity:1; background:var(--dsw-alias-bg-layer-2,#ececf1); }
+.asa-grip:active { cursor:grabbing; }
+.asa-card[data-dragging="true"] { max-height:34px; min-height:34px; overflow:hidden; opacity:.55;
+  border-style:dashed; padding:5px 11px; }
+.asa-card[data-dragging="true"] > * { pointer-events:none; }
+.asa-drop-gap { flex:none; border:1px dashed var(--dsw-alias-brand-primary,#3b6ef5); border-radius:10px;
+  background:var(--dsw-alias-bg-layer-2,#ececf1); opacity:.75; }
 .asa-card-head { display:flex; align-items:center; gap:6px; min-width:0; }
 .asa-card-title { font-size:13px; font-weight:600; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 .asa-card-sub { font-size:11.5px; color:var(--dsw-alias-label-secondary,#6b6b76); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }

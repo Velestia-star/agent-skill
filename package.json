@@ -1,6 +1,6 @@
 {
   "name": "dsh-agent-skill",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Agent & Skill: a sidebar panel for building your own subagents and skills, then calling any subagent by name in a conversation. Each subagent picks its model, reasoning effort, spawn/fork launch mode, tool allowlist and skill bundle; each skill is an ordinary SKILL.md you place globally or per workspace, down to individual conversations. · 智能体与技能：在侧栏里自己造子智能体与技能，并在对话中按名字调用；子智能体可配模型、思考强度、spawn/fork 启动方式、工具清单与技能，技能可放全局、按工作区甚至按单个对话生效。",
   "type": "module",
   "main": "index.js",

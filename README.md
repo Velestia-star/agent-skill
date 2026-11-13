@@ -9,6 +9,8 @@ The panel splits into two columns:
 - **Subagents (left)** — a named worker the model can delegate to: model route, reasoning effort, launch mode (`spawn` fresh conversation or `fork` inherited conversation), tool allowlist and attached skills.
 - **Skills (right)** — an ordinary `SKILL.md` instruction bundle with a description the model can trigger on: global, per workspace, or even per conversation.
 
+Both lists are drag-sortable: grab the six-dot handle on the left of a card, drag up or down, and a dashed gap opens between cards where the item will land. Drop to insert there; the order is written to the plugin store and survives a refresh or restart.
+
 ## Requirements
 
 - DeepSeek Harness with the Web UI (the panel is a Client slot entry).
@@ -80,11 +82,11 @@ In the subagent editor pick the skills under **Skills**. At delegation time the 
 
 | Data | Location |
 |---|---|
-| Subagent definitions | `<dshHome>/agent-skill/agents.json` |
-| Skill bindings | `<dshHome>/agent-skill/skills.json` |
+| Subagent definitions | `<dshHome>/agent-skill/agents.json` (each row carries its drag `order`) |
+| Skill bindings | `<dshHome>/agent-skill/skills.json` (also holds the drag `order` map) |
 | Conversation-scoped skill bodies | `<dshHome>/agent-skill/managed-skills/<name>/SKILL.md` |
 | Global skills | `<dshHome>/skills/<name>/SKILL.md` (plus `<agentsHome>/skills`) |
-| Project skills | `<workspace>/.dsh/skills/<name>/SKILL.md` |
+| Project skills | `<projectRoot>/.dsh/skills/<name>/SKILL.md` (nearest `.git` ancestor) |
 
 Those skill roots are the ones `@deepseek-ai/dsh-skill-filesystem` scans for the global and project sources (its custom and bundled roots are left alone), so anything written here reaches agents without a second provider. The panel also lists skills created outside it.
 
@@ -99,8 +101,10 @@ All routes are fenced to loopback requests (or a paired device) with same-origin
 | `GET` | `/api/dsh-agent-skill/skill?path=` | Read one `SKILL.md` inside a managed root |
 | `POST` | `/api/dsh-agent-skill/agents/save` | Create or update a subagent |
 | `POST` | `/api/dsh-agent-skill/agents/delete` | Delete a subagent |
+| `POST` | `/api/dsh-agent-skill/agents/reorder` | Persist a drag order (`{ ids }`, a full permutation) |
 | `POST` | `/api/dsh-agent-skill/skills/save` | Write a skill and its bindings |
 | `POST` | `/api/dsh-agent-skill/skills/delete` | Delete a skill and the files this plugin wrote for it |
+| `POST` | `/api/dsh-agent-skill/skills/reorder` | Persist a drag order (`{ names }`, a full permutation) |
 
 ## Model-facing tool
 

@@ -47,8 +47,10 @@ const MODEL_ROUTE = `${ROUTE_BASE}/model`
 const SKILL_ROUTE = `${ROUTE_BASE}/skill`
 const AGENT_SAVE_ROUTE = `${ROUTE_BASE}/agents/save`
 const AGENT_DELETE_ROUTE = `${ROUTE_BASE}/agents/delete`
+const AGENT_REORDER_ROUTE = `${ROUTE_BASE}/agents/reorder`
 const SKILL_SAVE_ROUTE = `${ROUTE_BASE}/skills/save`
 const SKILL_DELETE_ROUTE = `${ROUTE_BASE}/skills/delete`
+const SKILL_REORDER_ROUTE = `${ROUTE_BASE}/skills/reorder`
 
 const TOOL_NAME = 'delegate_agent'
 const SECTION_NAME = `${PLUGIN_ID}/session-skills`
@@ -541,6 +543,7 @@ function normalizeAgent(raw, existing) {
     model: model === '' ? undefined : model,
     reasoningEffort: reasoningEffort === '' ? undefined : reasoningEffort,
     maxDepth,
+    order: Number.isFinite(raw?.order) ? raw.order : existing?.order,
     tools: normalizeToolList(toolsSource),
     skills: Array.isArray(raw?.skills ?? existing?.skills)
       ? [
@@ -597,6 +600,7 @@ async function readAgentStore() {
   try {
     const parsed = JSON.parse(text.replace(/^\uFEFF/, ''))
     const list = Array.isArray(parsed?.agents) ? parsed.agents : []
+    const rank = (agent) => (Number.isFinite(agent.order) ? agent.order : Number.MAX_SAFE_INTEGER)
     return list
       .filter((agent) => agent && typeof agent.name === 'string' && agent.name !== '')
       .map((agent) => ({
@@ -606,6 +610,7 @@ async function readAgentStore() {
         mode: agent.mode === 'fork' ? 'fork' : 'spawn',
         maxDepth: Number.isFinite(agent.maxDepth) ? agent.maxDepth : 1,
       }))
+      .sort((a, b) => rank(a) - rank(b))
   } catch (error) {
     await quarantineCorrupt(agentsFile(), error)
     return []
@@ -626,7 +631,7 @@ async function writeAgentStore(agents) {
 /* ---------------------------------------------------------- skill bindings */
 
 function emptyBindings() {
-  return { version: 1, bindings: {} }
+  return { version: 1, bindings: {}, order: {} }
 }
 
 async function readBindings() {
@@ -640,7 +645,11 @@ async function readBindings() {
     const parsed = JSON.parse(text.replace(/^\uFEFF/, ''))
     const bindings = parsed?.bindings
     if (bindings === null || typeof bindings !== 'object' || Array.isArray(bindings)) return emptyBindings()
-    return { version: 1, bindings }
+    const order =
+      parsed?.order !== null && typeof parsed?.order === 'object' && !Array.isArray(parsed.order)
+        ? parsed.order
+        : {}
+    return { version: 1, bindings, order }
   } catch (error) {
     await quarantineCorrupt(bindingsFile(), error)
     return emptyBindings()
@@ -672,7 +681,9 @@ function sessionsOfBinding(binding) {
 
 async function collectSkills(ctx) {
   const { roots, projectRoots } = allSkillRoots(ctx)
-  const bindings = (await readBindings()).bindings
+  const state = await readBindings()
+  const bindings = state.bindings
+  const order = state.order ?? {}
   const byName = new Map()
 
   const absorb = (skill) => {
@@ -721,7 +732,13 @@ async function collectSkills(ctx) {
     })
   }
 
-  return [...byName.values()].sort((a, b) => a.name.localeCompare(b.name))
+  const rank = (name) => (Number.isFinite(order[name]) ? order[name] : Number.MAX_SAFE_INTEGER)
+  return [...byName.values()].sort((a, b) => {
+    const left = rank(a.name)
+    const right = rank(b.name)
+    if (left !== right) return left - right
+    return a.name.localeCompare(b.name)
+  })
 }
 
 function presentBinding(binding) {
@@ -1203,6 +1220,41 @@ export function apply(ctx) {
     }
   }
 
+  const handleReorderAgents = async (request, response) => {
+    if (!methodAllowed(request, response, ['POST'])) return
+    let body
+    try {
+      body = await readJsonBody(request)
+    } catch (error) {
+      sendJson(request, response, 400, { error: error instanceof Error ? error.message : 'invalid-json' })
+      return
+    }
+    try {
+      const ids = Array.isArray(body.ids) ? body.ids.map(String) : []
+      const ordered = await withMutation(async () => {
+        const agents = await readAgentStore()
+        if (ids.length !== agents.length) throw httpError(400, 'invalid-order')
+        const known = new Map(agents.map((agent) => [agent.id, agent]))
+        const seen = new Set()
+        const next = []
+        for (const id of ids) {
+          if (seen.has(id) || !known.has(id)) throw httpError(400, 'invalid-order')
+          seen.add(id)
+          const agent = known.get(id)
+          next.push({ ...agent, order: next.length })
+        }
+        await writeAgentStore(next)
+        return next
+      })
+      currentAgents = ordered
+      syncDelegateTool()
+      sendJson(request, response, 200, { agents: ordered })
+    } catch (error) {
+      const status = Number(error?.status) || 500
+      sendJson(request, response, status, { error: error instanceof Error ? error.message : 'reorder-failed' })
+    }
+  }
+
   const handleDeleteAgent = async (request, response) => {
     if (!methodAllowed(request, response, ['POST'])) return
     let body
@@ -1352,7 +1404,12 @@ export function apply(ctx) {
           (file) => !files.some((next) => canonicalKey(next) === canonicalKey(file)),
         )
         await removeFiles(stale)
-        if (originalName !== '' && originalName !== name) delete state.bindings[originalName]
+        if (originalName !== '' && originalName !== name) {
+          delete state.bindings[originalName]
+          // Renaming keeps the card where the user dragged it.
+          if (Number.isFinite(state.order[originalName])) state.order[name] = state.order[originalName]
+          delete state.order[originalName]
+        }
         state.bindings[name] = {
           scope,
           workspaces: selection,
@@ -1401,6 +1458,7 @@ export function apply(ctx) {
         for (const file of binding?.files ?? []) targets.add(file)
         if (name !== '') {
           delete state.bindings[name]
+          delete state.order[name]
           await writeBindings(state)
         }
         await removeFiles([...targets])
@@ -1413,6 +1471,40 @@ export function apply(ctx) {
       const status = Number(error?.status) || 500
       logWarn(`skill delete failed: ${error instanceof Error ? error.message : String(error)}`)
       sendJson(request, response, status, { error: error instanceof Error ? error.message : 'delete-failed' })
+    }
+  }
+
+  const handleReorderSkills = async (request, response) => {
+    if (!methodAllowed(request, response, ['POST'])) return
+    let body
+    try {
+      body = await readJsonBody(request)
+    } catch (error) {
+      sendJson(request, response, 400, { error: error instanceof Error ? error.message : 'invalid-json' })
+      return
+    }
+    try {
+      const names = Array.isArray(body.names) ? body.names.map((value) => normalizeSkillName(value)) : []
+      const order = await withMutation(async () => {
+        const state = await readBindings()
+        const current = (await collectSkills(ctx)).map((skill) => skill.name)
+        if (names.length !== current.length) throw httpError(400, 'invalid-order')
+        const known = new Set(current)
+        const seen = new Set()
+        const next = {}
+        for (const name of names) {
+          if (seen.has(name) || !known.has(name)) throw httpError(400, 'invalid-order')
+          seen.add(name)
+          next[name] = Object.keys(next).length
+        }
+        state.order = next
+        await writeBindings(state)
+        return next
+      })
+      sendJson(request, response, 200, { order, skills: await collectSkills(ctx) })
+    } catch (error) {
+      const status = Number(error?.status) || 500
+      sendJson(request, response, status, { error: error instanceof Error ? error.message : 'reorder-failed' })
     }
   }
 
@@ -1443,8 +1535,10 @@ export function apply(ctx) {
         webServer.register({ kind: 'exact', path: SKILL_ROUTE, handler: fenced(handleReadSkill) }),
         webServer.register({ kind: 'exact', path: AGENT_SAVE_ROUTE, handler: fenced(handleSaveAgent) }),
         webServer.register({ kind: 'exact', path: AGENT_DELETE_ROUTE, handler: fenced(handleDeleteAgent) }),
+        webServer.register({ kind: 'exact', path: AGENT_REORDER_ROUTE, handler: fenced(handleReorderAgents) }),
         webServer.register({ kind: 'exact', path: SKILL_SAVE_ROUTE, handler: fenced(handleSaveSkill) }),
         webServer.register({ kind: 'exact', path: SKILL_DELETE_ROUTE, handler: fenced(handleDeleteSkill) }),
+        webServer.register({ kind: 'exact', path: SKILL_REORDER_ROUTE, handler: fenced(handleReorderSkills) }),
       ]
       return () => {
         for (const dispose of disposers.splice(0)) {
