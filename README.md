@@ -119,6 +119,8 @@ One tool is registered globally: `delegate_agent`.
 }
 ```
 
+`agent` accepts the configured name, its display name, or a unique prefix of either (`chief` resolves `chief-of-staff`, `幕僚长` resolves the same agent). An ambiguous prefix reports every candidate instead of guessing.
+
 Honest limits:
 
 - A `spawn` child does not see this conversation; write the prompt so it stands alone. Use `fork` when the child must build on the finished turns.

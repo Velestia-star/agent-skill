@@ -1701,9 +1701,28 @@ export function apply(ctx) {
 
     const agents = currentAgents.length > 0 ? currentAgents : await readAgentStore()
     const wanted = String(args?.agent ?? '').trim()
+    const needle = wanted.toLowerCase()
+    const lowerName = (agent) => String(agent.name ?? '').toLowerCase()
+    const lowerDisplay = (agent) => String(agent.displayName ?? '').toLowerCase()
+    const uniqueMatch = (candidates) => {
+      if (candidates.length === 0) return undefined
+      if (candidates.length === 1) return candidates[0]
+      throw new Error(
+        `"${wanted}" 匹配到多个子智能体（${candidates.map((agent) => agent.name).join('、')}），请写完整名字。`,
+      )
+    }
+    // Exact name first, then the display label, then a unique prefix of either.
+    // An ambiguous prefix is reported instead of guessing.
     const definition =
       agents.find((agent) => agent.name === wanted) ??
-      agents.find((agent) => agent.name.toLowerCase() === wanted.toLowerCase())
+      agents.find((agent) => lowerName(agent) === needle) ??
+      (needle === '' ? undefined : agents.find((agent) => lowerDisplay(agent) === needle)) ??
+      (needle === ''
+        ? undefined
+        : uniqueMatch(agents.filter((agent) => lowerName(agent).startsWith(needle)))) ??
+      (needle === ''
+        ? undefined
+        : uniqueMatch(agents.filter((agent) => lowerDisplay(agent).startsWith(needle))))
     if (definition === undefined) {
       throw new Error(
         agents.length === 0
@@ -1809,7 +1828,6 @@ export function apply(ctx) {
 
   const buildDelegateDefinition = () => {
     const agents = currentAgents
-    const names = agents.map((agent) => agent.name)
     const described = agents.map((agent) => {
       const route = agent.model ? `${agent.provider ?? 'default'}/${agent.model}` : 'inherited'
       const skills = agent.skills.length > 0 ? `; skills: ${agent.skills.join(', ')}` : ''
@@ -1834,8 +1852,11 @@ export function apply(ctx) {
         properties: {
           agent: {
             type: 'string',
-            ...(names.length === 0 ? {} : { enum: names }),
-            description: 'Name of the subagent to run.',
+            // No enum: the Host also accepts a display name or a unique prefix
+            // (e.g. "chief" for "chief-of-staff"), so the model may pass the
+            // shorthand the user actually used. Ambiguity is reported back.
+            description:
+              'Name of the subagent to run: its configured name, its display name, or a unique prefix of either.',
           },
           description: {
             type: 'string',

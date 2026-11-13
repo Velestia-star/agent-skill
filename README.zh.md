@@ -119,6 +119,8 @@ dsh plugin install /absolute/path/to/dsh-agent-skill
 }
 ```
 
+`agent` 接受配置名、显示名，或二者之一的唯一前缀（`chief` 会解析到 `chief-of-staff`，`幕僚长` 同样命中）。前缀有歧义时会报出全部候选，而不是随便挑一个。
+
 如实说明的限制：
 
 - `spawn` 子智能体看不到这段对话，任务提示必须自洽；要让子智能体接着已完成的回合干，选 `fork`。

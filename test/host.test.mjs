@@ -483,6 +483,42 @@ test('delegating a fork agent selects the fork backend', async () => {
   assert.equal(harness.state.activation.request.agentOptions, undefined)
 })
 
+test('a subagent answers to its display name and to a unique prefix', async () => {
+  const saved = await post(harness.state, ROUTES.agentSave, {
+    name: 'chief-of-staff',
+    displayName: '幕僚长',
+    description: 'Coordinates the team.',
+  })
+  assert.equal(saved.status, 200)
+  const tool = harness.state.tools.get('delegate_agent')
+  const run = (agent) =>
+    tool.execute(
+      { agent, prompt: 'x' },
+      { agent: { id: 'parent-session' }, signal: new AbortController().signal },
+    )
+
+  await run('chief')
+  assert.equal(harness.state.activation.label, '幕僚长')
+  await run('CHIEF')
+  assert.equal(harness.state.activation.label, '幕僚长')
+  await run('幕僚长')
+  assert.equal(harness.state.activation.label, '幕僚长')
+
+  // An ambiguous prefix names both candidates instead of guessing.
+  const devManager = await post(harness.state, ROUTES.agentSave, { name: 'dev-manager' })
+  const devOps = await post(harness.state, ROUTES.agentSave, { name: 'dev-ops' })
+  await assert.rejects(run('dev'), (error) => {
+    assert.match(String(error.message), /匹配到多个子智能体/)
+    assert.match(String(error.message), /dev-manager/)
+    assert.match(String(error.message), /dev-ops/)
+    return true
+  })
+
+  await post(harness.state, ROUTES.agentDelete, { id: saved.json.agent.id })
+  await post(harness.state, ROUTES.agentDelete, { id: devManager.json.agent.id })
+  await post(harness.state, ROUTES.agentDelete, { id: devOps.json.agent.id })
+})
+
 test('deleting a skill removes the files this plugin wrote', async () => {
   // A same-named skill in a different root is NOT owned by this panel; deleting
   // the global skill must leave it alone.
