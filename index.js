@@ -1919,35 +1919,41 @@ export function apply(ctx) {
    * behave identically.
    */
   const registerChiefCommand = () => {
-    const commands = useService(ctx, 'commands')
-    if (!commands || typeof commands.register !== 'function') return
+    if (typeof ctx.inject !== 'function') return
     try {
-      ctx.effect(() =>
-        commands.register({
-          name: 'chief',
-          description: '把任务直接交给 chief 子智能体执行，不经过主模型判断。',
-          input: { hint: '<任务：目标 / 范围 / 约束 / 回报>' },
-          recordInput: true,
-          async handler(invocation) {
-            const task = String(invocation?.rawInput ?? '').trim()
-            if (task === '') {
-              return { kind: 'error', text: '用法：/chief <任务>' }
-            }
-            try {
-              const childId = await startDelegation(
-                { agent: 'chief', prompt: task },
-                { agent: invocation.agent, signal: invocation.signal },
-              )
-              return {
-                kind: 'success',
-                text: `已交给 chief（子会话 ${childId}），完成后结果会回到本会话。`,
+      // `commands` is optional: wait until the service is mounted instead of
+      // reading it once during apply (a profile may load it later).
+      ctx.inject(['commands'], (scope) => {
+        const commands =
+          (typeof scope.get === 'function' ? scope.get('commands', false) : undefined) ?? scope.commands
+        if (!commands || typeof commands.register !== 'function') return
+        scope.effect(() =>
+          commands.register({
+            name: 'chief',
+            description: '把任务直接交给 chief 子智能体执行，不经过主模型判断。',
+            input: { hint: '<任务：目标 / 范围 / 约束 / 回报>' },
+            recordInput: true,
+            async handler(invocation) {
+              const task = String(invocation?.rawInput ?? '').trim()
+              if (task === '') {
+                return { kind: 'error', text: '用法：/chief <任务>' }
               }
-            } catch (error) {
-              return { kind: 'error', text: error instanceof Error ? error.message : String(error) }
-            }
-          },
-        }),
-      )
+              try {
+                const childId = await startDelegation(
+                  { agent: 'chief', prompt: task },
+                  { agent: invocation.agent, signal: invocation.signal },
+                )
+                return {
+                  kind: 'success',
+                  text: `已交给 chief（子会话 ${childId}），完成后结果会回到本会话。`,
+                }
+              } catch (error) {
+                return { kind: 'error', text: error instanceof Error ? error.message : String(error) }
+              }
+            },
+          }),
+        )
+      })
     } catch (error) {
       logWarn(`chief command registration failed: ${error instanceof Error ? error.message : String(error)}`)
     }

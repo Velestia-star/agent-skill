@@ -153,6 +153,11 @@ function makeHarness({ workspaces = [], sessions = [], liveAgents = [] } = {}) {
       state.listeners.set(event, list)
       return () => {}
     },
+    inject(deps, callback) {
+      if (deps.every((name) => services[name] !== undefined)) callback(ctx)
+      return () => {}
+    },
+    commands: services.commands,
     tools: services.tools,
   }
 
