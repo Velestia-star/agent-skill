@@ -49,6 +49,7 @@ function makeHarness({ workspaces = [], sessions = [], liveAgents = [] } = {}) {
     teamCatalog: {},
     teamError: false,
     traceRoot: null,
+    traceAncestors: [],
   }
 
   const services = {
@@ -133,7 +134,7 @@ function makeHarness({ workspaces = [], sessions = [], liveAgents = [] } = {}) {
         const rootId = state.traceRoot ?? sessionId
         return {
           target: { header: { id: sessionId } },
-          ancestors: [],
+          ancestors: state.traceAncestors.map((id) => ({ header: { id } })),
           descendants: [],
           complete: true,
           root: { header: { id: rootId } },
@@ -413,6 +414,7 @@ test('team route returns the running and idle members of the conversation tree',
   assert.equal(status, 200)
   assert.equal(json.rootId, 'session-alpha')
   assert.equal(json.currentId, 'session-alpha')
+  assert.deepEqual(json.trail, ['session-alpha'])
   assert.equal(json.nodes.length, 3)
   assert.equal(json.nodes[0].activity, 'running')
   assert.equal(json.nodes[0].label, '研发主管')
@@ -461,6 +463,16 @@ test('team route expands one branch on demand', async () => {
   harness.state.teamCatalog = {}
 })
 
+test('team route returns the root-to-current trail in order', async () => {
+  harness.state.traceRoot = 'root-session'
+  harness.state.traceAncestors = ['mid-session', 'root-session']
+  const { status, json } = await call(harness.state, `${ROUTES.team}?sessionId=child-session`)
+  assert.equal(status, 200)
+  assert.deepEqual(json.trail, ['root-session', 'mid-session', 'child-session'])
+  harness.state.traceRoot = null
+  harness.state.traceAncestors = []
+})
+
 test('team route traces a child conversation back to its root', async () => {
   harness.state.traceRoot = 'root-session'
   harness.state.teamNodes = []
@@ -468,6 +480,7 @@ test('team route traces a child conversation back to its root', async () => {
   assert.equal(status, 200)
   assert.equal(json.rootId, 'root-session')
   assert.equal(json.currentId, 'child-session')
+  assert.deepEqual(json.trail, ['root-session', 'child-session'])
   harness.state.traceRoot = null
 })
 

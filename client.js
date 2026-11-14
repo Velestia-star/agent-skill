@@ -16,6 +16,8 @@ window.__ModuleLoader__.load({
     const API_SKILL_SAVE = '/api/dsh-agent-skill/skills/save'
     const API_SKILL_DELETE = '/api/dsh-agent-skill/skills/delete'
     const API_SKILL_ARRANGE = '/api/dsh-agent-skill/skills/arrange'
+    /** Set in apply(); SessionTarget is a SessionId or a subagent address. */
+    let teamOpenSession = null
 
     /* ------------------------------------------------------------ locale */
 
@@ -41,6 +43,7 @@ window.__ModuleLoader__.load({
       'team.emptyBranch': '无子智能体',
       'team.expand': '展开',
       'team.collapse': '收起',
+      'team.openSession': '点击打开该对话',
       'team.error': '读取智能体团队失败',
       'team.retry': '重试',
       'team.loading': '读取中…',
@@ -217,6 +220,7 @@ window.__ModuleLoader__.load({
       'team.emptyBranch': 'No subagents',
       'team.expand': 'Expand',
       'team.collapse': 'Collapse',
+      'team.openSession': 'Open this conversation',
       'team.error': 'Could not read the agent team',
       'team.retry': 'Retry',
       'team.loading': 'Loading…',
@@ -875,6 +879,9 @@ window.__ModuleLoader__.load({
       const dialogRef = useRef(null)
       const abortRef = useRef(null)
       const branchAbortRef = useRef(new Map())
+      const branchPromisesRef = useRef(new Map())
+      const revealPathRef = useRef(null)
+      const revealedCurrentRef = useRef('')
       const hasDataRef = useRef(false)
       const inflightRef = useRef(false)
       const pausedRef = useRef(false)
@@ -979,6 +986,17 @@ window.__ModuleLoader__.load({
             setBranches((previous) => ({ ...previous, [nextRoot]: nextNodes }))
           }
           setStatus('ready')
+          const trail = Array.isArray(payload?.trail) ? payload.trail : []
+          const nextCurrent = typeof payload?.currentId === 'string' ? payload.currentId : sessionId
+          if (trail.length > 0 && revealedCurrentRef.current !== nextCurrent) {
+            revealedCurrentRef.current = nextCurrent
+            const reveal = revealPathRef.current
+            if (typeof reveal === 'function') {
+              window.setTimeout(() => {
+                void reveal(trail)
+              }, 0)
+            }
+          }
         } catch (failure) {
           if (failure?.name === 'AbortError') {
             if (!timedOut || !mountedRef.current) return
@@ -1002,6 +1020,7 @@ window.__ModuleLoader__.load({
       const refreshTeam = useCallback(() => {
         pausedRef.current = false
         hasDataRef.current = false
+        revealedCurrentRef.current = ''
         setExpanded({})
         setBranchErrors({})
         setBranchLoading({})
@@ -1018,21 +1037,12 @@ window.__ModuleLoader__.load({
         void load()
       }, [load])
 
-      const toggleBranch = useCallback(
-        (node) => {
-          const id = typeof node?.id === 'string' ? node.id : ''
-          if (id === '') return
-          if (expanded[id] === true) {
-            setExpanded((previous) => ({ ...previous, [id]: false }))
-            return
-          }
-          if (Array.isArray(branches[id])) {
-            setExpanded((previous) => ({ ...previous, [id]: true }))
-            return
-          }
-          // The Map is the synchronous guard: two clicks in the same render
-          // both see the old `branchLoading` state.
-          if (branchAbortRef.current.has(id)) return
+      const ensureBranch = useCallback(
+        (id) => {
+          if (typeof id !== 'string' || id === '') return Promise.resolve(null)
+          if (Array.isArray(branches[id])) return Promise.resolve(branches[id])
+          const pending = branchPromisesRef.current.get(id)
+          if (pending !== undefined) return pending
           setBranchLoading((previous) => ({ ...previous, [id]: true }))
           setBranchErrors((previous) => {
             if (previous[id] === undefined) return previous
@@ -1051,30 +1061,32 @@ window.__ModuleLoader__.load({
               /* ignore */
             }
           }, 8000)
-          getJson(
+          const promise = getJson(
             `${API_TEAM}?sessionId=${encodeURIComponent(sessionId)}&parentId=${encodeURIComponent(id)}`,
             { signal: controller.signal },
           )
             .then((payload) => {
-              if (!mountedRef.current) return
+              if (!mountedRef.current) return null
               const children = Array.isArray(payload?.nodes) ? payload.nodes : []
               setBranches((previous) => ({ ...previous, [id]: children }))
-              setExpanded((previous) => ({ ...previous, [id]: true }))
+              return children
             })
             .catch((failure) => {
               if (failure?.name === 'AbortError') {
-                if (!timedOut || !mountedRef.current) return
+                if (!timedOut || !mountedRef.current) return null
                 setBranchErrors((previous) => ({ ...previous, [id]: t('team.timeout') }))
-                return
+                return null
               }
-              if (!mountedRef.current) return
+              if (!mountedRef.current) return null
               setBranchErrors((previous) => ({ ...previous, [id]: describeError(failure) }))
+              return null
             })
             .finally(() => {
               window.clearTimeout(timeoutId)
               if (branchAbortRef.current.get(id) === controller) {
                 branchAbortRef.current.delete(id)
               }
+              branchPromisesRef.current.delete(id)
               if (!mountedRef.current) return
               setBranchLoading((previous) => {
                 if (previous[id] !== true) return previous
@@ -1083,8 +1095,53 @@ window.__ModuleLoader__.load({
                 return next
               })
             })
+          branchPromisesRef.current.set(id, promise)
+          return promise
         },
-        [branches, expanded, sessionId],
+        [branches, sessionId],
+      )
+
+      const revealPath = useCallback(
+        async (trail) => {
+          if (!Array.isArray(trail) || trail.length <= 1) return
+          for (let index = 1; index < trail.length - 1; index += 1) {
+            const parent = trail[index]
+            const children = await ensureBranch(parent)
+            if (children === null || !mountedRef.current) return
+            setExpanded((previous) => ({ ...previous, [parent]: true }))
+          }
+          if (!mountedRef.current) return
+          window.setTimeout(() => {
+            try {
+              const node = dialogRef.current?.querySelector('.asa-team-row[data-current="true"]')
+              node?.scrollIntoView({ block: 'center' })
+            } catch {
+              /* scrolling is best effort */
+            }
+          }, 80)
+        },
+        [ensureBranch],
+      )
+      revealPathRef.current = revealPath
+
+      const toggleBranch = useCallback(
+        (node) => {
+          const id = typeof node?.id === 'string' ? node.id : ''
+          if (id === '') return
+          if (expanded[id] === true) {
+            setExpanded((previous) => ({ ...previous, [id]: false }))
+            return
+          }
+          if (Array.isArray(branches[id])) {
+            setExpanded((previous) => ({ ...previous, [id]: true }))
+            return
+          }
+          void ensureBranch(id).then((children) => {
+            if (children === null || !mountedRef.current) return
+            setExpanded((previous) => ({ ...previous, [id]: true }))
+          })
+        },
+        [branches, ensureBranch, expanded],
       )
 
       useEffect(() => {
@@ -1145,6 +1202,21 @@ window.__ModuleLoader__.load({
         },
         icon('teamTree', 14),
         h('span', { className: 'asa-team-button-label' }, t('team.button')),
+      )
+
+      const openNode = useCallback(
+        (node) => {
+          if (typeof teamOpenSession !== 'function') return
+          if (!node || typeof node.id !== 'string' || node.id === '') return
+          if (node.kind === 'diagnostic' || node.mode === 'external') return
+          const target =
+            typeof node.parentId === 'string' && node.parentId !== '' && node.mode !== 'unknown'
+              ? { parentSessionId: node.parentId, childSessionId: node.id, mode: node.mode }
+              : node.id
+          teamOpenSession(target)
+          setOpen(false)
+        },
+        [],
       )
 
       const loadedNodes = []
@@ -1213,16 +1285,40 @@ window.__ModuleLoader__.load({
                   icon('chevron', 12),
                 )
               : h('span', { className: 'asa-team-toggle asa-team-toggle-empty' }),
-            h('span', {
-              className: `asa-team-dot ${isRunning ? 'asa-team-dot-running' : 'asa-team-dot-idle'}`,
-              'aria-label': isRunning ? t('team.running') : t('team.idle'),
-            }),
-            h('span', { className: 'asa-team-name' }, label),
-            isCurrent ? h('span', { className: 'asa-team-current' }, t('team.current')) : null,
-            h('span', { className: `asa-team-meta${diagnostic ? ' asa-team-warn' : ''}` }, meta),
-            loaded && children.length > 0
-              ? h('span', { className: 'asa-team-count' }, String(children.length))
-              : null,
+            (() => {
+              const pieces = [
+                h('span', {
+                  key: 'dot',
+                  className: `asa-team-dot ${isRunning ? 'asa-team-dot-running' : 'asa-team-dot-idle'}`,
+                  'aria-label': isRunning ? t('team.running') : t('team.idle'),
+                }),
+                h('span', { key: 'name', className: 'asa-team-name' }, label),
+                isCurrent
+                  ? h('span', { key: 'current', className: 'asa-team-current' }, t('team.current'))
+                  : null,
+                h('span', { key: 'meta', className: `asa-team-meta${diagnostic ? ' asa-team-warn' : ''}` }, meta),
+                loaded && children.length > 0
+                  ? h('span', { key: 'count', className: 'asa-team-count' }, String(children.length))
+                  : null,
+              ]
+              if (diagnostic || node.mode === 'external' || typeof teamOpenSession !== 'function') {
+                return h('div', { className: 'asa-team-open asa-team-open-static' }, pieces)
+              }
+              return h(
+                'button',
+                {
+                  type: 'button',
+                  className: 'asa-team-open',
+                  title: t('team.openSession'),
+                  onClick: (event) => {
+                    event.preventDefault()
+                    event.stopPropagation()
+                    openNode(node)
+                  },
+                },
+                pieces,
+              )
+            })(),
           ),
           isLoading ? h('div', { className: 'asa-team-branch-loading' }, t('team.loading')) : null,
           branchError ? h('div', { className: 'asa-team-branch-error' }, branchError) : null,
@@ -3166,14 +3262,16 @@ window.__ModuleLoader__.load({
 .asa-team-button[aria-expanded="true"] { background:var(--dsw-alias-bg-layer-2,#ececf1); color:var(--dsw-alias-label-primary,#1b1b1f); }
 .asa-team-button-label { line-height:1; }
 .asa-team-panel { position:fixed; z-index:80; display:flex; flex-direction:column; overflow:hidden;
-  border:1px solid var(--dsw-alias-border-l1,#e4e4ea); border-radius:12px; background:var(--dsw-alias-bg-overlay,#1b1b1f);
+  border:1px solid var(--dsw-alias-border-l1,#e4e4ea); border-radius:12px;
+  background:var(--dsw-specific-menu,var(--dsw-menu-surface-fill,#303136a3));
+  backdrop-filter:var(--dsw-menu-backdrop-filter); -webkit-backdrop-filter:var(--dsw-menu-backdrop-filter);
   color:var(--dsw-alias-label-primary,#1b1b1f); box-shadow:0 12px 32px rgba(0,0,0,.28); -webkit-app-region:no-drag; }
 .asa-team-dialog { margin:0; inset:auto; padding:0; max-width:calc(100vw - 24px); }
 .asa-team-dialog:not([open]) { display:none; }
 .asa-team-dialog::backdrop { background:transparent; }
 .asa-team-panel:focus { outline:none; }
 .asa-team-head { flex:none; display:flex; align-items:center; gap:7px; padding:9px 10px;
-  border-bottom:1px solid var(--dsw-alias-border-l1,#e4e4ea); background:var(--dsw-alias-bg-layer-1,#f6f6f8); }
+  border-bottom:1px solid var(--dsw-alias-border-l1,#e4e4ea); background:transparent; }
 .asa-team-head-icon { display:inline-flex; color:var(--dsw-alias-label-secondary,#6b6b76); }
 .asa-team-head-title { font-size:13px; font-weight:600; white-space:nowrap; }
 .asa-team-summary { flex:1; min-width:0; font-size:11px; color:var(--dsw-alias-label-secondary,#6b6b76);
@@ -3200,6 +3298,10 @@ window.__ModuleLoader__.load({
 .asa-team-row { display:flex; align-items:center; gap:6px; min-width:0; padding:4px 6px; border-radius:6px; }
 .asa-team-row:hover { background:var(--dsw-alias-bg-layer-2,#ececf1); }
 .asa-team-row[data-current="true"] { background:var(--dsw-alias-bg-layer-2,#ececf1); }
+.asa-team-open { display:flex; align-items:center; gap:6px; flex:1; min-width:0; padding:0; margin:0;
+  border:none; background:none; color:inherit; font:inherit; text-align:left; cursor:pointer; }
+.asa-team-open-static { cursor:default; }
+.asa-team-open:focus-visible { outline:2px solid var(--dsw-alias-brand-primary,#3b6ef5); outline-offset:2px; border-radius:4px; }
 .asa-team-toggle { display:inline-flex; align-items:center; justify-content:center; width:16px; height:16px;
   flex:none; padding:0; border:none; border-radius:4px; background:none;
   color:var(--dsw-alias-label-secondary,#6b6b76); cursor:pointer; -webkit-app-region:no-drag; }
@@ -3240,6 +3342,20 @@ window.__ModuleLoader__.load({
       inject: ['slots'],
       apply(ctx) {
         const disposers = []
+        try {
+          const uiWorkspace = ctx.get('uiWorkspace', false)
+          if (uiWorkspace && typeof uiWorkspace.openSession === 'function') {
+            teamOpenSession = (target) => {
+              try {
+                uiWorkspace.openSession(target)
+              } catch {
+                /* navigation is best effort */
+              }
+            }
+          }
+        } catch {
+          /* the optional navigation service is absent */
+        }
         const locale = (() => {
           try {
             return ctx.get('locale', false)

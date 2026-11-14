@@ -1265,12 +1265,24 @@ export function apply(ctx) {
       return
     }
     let rootId = sessionId
+    let trail = [sessionId]
     if (typeof sessionQuery.traceSession === 'function') {
       try {
         const trace = await sessionQuery.traceSession(sessionId)
         if (trace?.complete === true) {
           const traceRoot = trace.root?.header?.id
           if (typeof traceRoot === 'string' && traceRoot !== '') rootId = traceRoot
+          const ancestors = Array.isArray(trace.ancestors)
+            ? trace.ancestors
+                .map((record) => record?.header?.id)
+                .filter((id) => typeof id === 'string' && id !== '')
+            : []
+          // `traceSession` walks from the current session up to the root; the
+          // panel needs the opposite order (root first) for its reveal path.
+          const path = ancestors.slice().reverse()
+          if (path[0] !== rootId) path.unshift(rootId)
+          if (!path.includes(sessionId)) path.push(sessionId)
+          trail = path
         }
       } catch {
         /* fall back to the current session */
@@ -1324,6 +1336,7 @@ export function apply(ctx) {
       rootId,
       currentId: sessionId,
       parentId,
+      trail,
       nodes,
       truncated: rows.length > MAX_TEAM_NODES,
       updatedAt: Date.now(),
