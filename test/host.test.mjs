@@ -46,9 +46,9 @@ function makeHarness({ workspaces = [], sessions = [], liveAgents = [] } = {}) {
     section: undefined,
     commands: new Map(),
     teamNodes: [],
+    teamCatalog: {},
     teamError: false,
     traceRoot: null,
-    rootTitle: 'Root conversation',
   }
 
   const services = {
@@ -77,10 +77,6 @@ function makeHarness({ workspaces = [], sessions = [], liveAgents = [] } = {}) {
     subagents: {
       getProvider: () => ({ name: 'spawn' }),
       resolveMaxDepth: (configured) => configured,
-      listDescendants: async () => {
-        if (state.teamError) throw new Error('team unavailable')
-        return state.teamNodes
-      },
       startActivation: async (spec) => {
         state.activation = spec
         return {
@@ -143,7 +139,14 @@ function makeHarness({ workspaces = [], sessions = [], liveAgents = [] } = {}) {
           root: { header: { id: rootId } },
         }
       },
-      readTitle: async () => ({ title: { title: state.rootTitle } }),
+      observeSession: async (sessionId) => {
+        if (state.teamError) throw new Error('team unavailable')
+        const rows = state.teamCatalog[sessionId] ?? state.teamNodes
+        return {
+          projections: { values: { subagentCatalog: rows } },
+          [Symbol.dispose]: () => {},
+        }
+      },
     },
     llm: {
       listProviders: () => [{ id: 'fake-provider', name: 'Fake Provider' }],
@@ -410,7 +413,6 @@ test('team route returns the running and idle members of the conversation tree',
   assert.equal(status, 200)
   assert.equal(json.rootId, 'session-alpha')
   assert.equal(json.currentId, 'session-alpha')
-  assert.equal(json.rootTitle, 'Root conversation')
   assert.equal(json.nodes.length, 3)
   assert.equal(json.nodes[0].activity, 'running')
   assert.equal(json.nodes[0].label, '研发主管')
@@ -436,6 +438,27 @@ test('team route validates the session id, fence and descendant failures', async
   assert.equal(failed.status, 500)
   assert.equal(failed.json.error, 'team-unavailable')
   harness.state.teamError = false
+})
+
+test('team route expands one branch on demand', async () => {
+  harness.state.traceRoot = null
+  harness.state.teamCatalog = {
+    'child-a': [
+      { id: 'grand-1', activity: 'running', mode: 'continuable', label: '执行体' },
+    ],
+  }
+  const { status, json } = await call(
+    harness.state,
+    `${ROUTES.team}?sessionId=session-alpha&parentId=child-a`,
+  )
+  assert.equal(status, 200)
+  assert.equal(json.parentId, 'child-a')
+  assert.equal(json.rootId, 'session-alpha')
+  assert.equal(json.nodes.length, 1)
+  assert.equal(json.nodes[0].id, 'grand-1')
+  assert.equal(json.nodes[0].parentId, 'child-a')
+  assert.equal(json.nodes[0].activity, 'running')
+  harness.state.teamCatalog = {}
 })
 
 test('team route traces a child conversation back to its root', async () => {

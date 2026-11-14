@@ -38,6 +38,9 @@ window.__ModuleLoader__.load({
       'team.currentSession': '当前会话',
       'team.main': '主会话',
       'team.empty': '当前对话还没有子智能体。',
+      'team.emptyBranch': '无子智能体',
+      'team.expand': '展开',
+      'team.collapse': '收起',
       'team.error': '读取智能体团队失败',
       'team.retry': '重试',
       'team.loading': '读取中…',
@@ -45,6 +48,7 @@ window.__ModuleLoader__.load({
       'team.close': '关闭',
       'team.refresh': '刷新',
       'team.diagnostic': '目录异常：{reason}',
+      'team.timeout': '读取超时，先显示无。',
       'error.missing-session': '拿不到当前会话 ID。',
       'error.team-unavailable': '智能体团队暂时读不到，稍后重试。',
       'panel.sortHint': '拖动排序',
@@ -210,6 +214,9 @@ window.__ModuleLoader__.load({
       'team.currentSession': 'Current conversation',
       'team.main': 'Main conversation',
       'team.empty': 'No subagents in this conversation yet.',
+      'team.emptyBranch': 'No subagents',
+      'team.expand': 'Expand',
+      'team.collapse': 'Collapse',
       'team.error': 'Could not read the agent team',
       'team.retry': 'Retry',
       'team.loading': 'Loading…',
@@ -217,6 +224,7 @@ window.__ModuleLoader__.load({
       'team.close': 'Close',
       'team.refresh': 'Refresh',
       'team.diagnostic': 'Catalog error: {reason}',
+      'team.timeout': 'Read timed out; showing none.',
       'error.missing-session': 'Could not resolve the current session id.',
       'error.team-unavailable': 'The agent team is unavailable right now.',
       'panel.sortHint': 'Drag to arrange',
@@ -852,18 +860,6 @@ window.__ModuleLoader__.load({
 
     /* ----------------------------------------------------------- team tree */
 
-    function teamChildrenMap(nodes) {
-      const byParent = new Map()
-      const ids = new Set(nodes.map((node) => node.id))
-      for (const node of nodes) {
-        const parent = node.parentId && ids.has(node.parentId) ? node.parentId : '__root__'
-        const list = byParent.get(parent) ?? []
-        list.push(node)
-        byParent.set(parent, list)
-      }
-      return byParent
-    }
-
     function AgentTeamButton(props) {
       const sessionId = typeof props?.sessionId === 'string' ? props.sessionId : ''
       const [open, setOpen] = useState(false)
@@ -871,9 +867,17 @@ window.__ModuleLoader__.load({
       const [data, setData] = useState(null)
       const [error, setError] = useState(null)
       const [anchor, setAnchor] = useState(null)
+      const [branches, setBranches] = useState({})
+      const [expanded, setExpanded] = useState({})
+      const [branchLoading, setBranchLoading] = useState({})
+      const [branchErrors, setBranchErrors] = useState({})
       const buttonRef = useRef(null)
       const dialogRef = useRef(null)
       const abortRef = useRef(null)
+      const branchAbortRef = useRef(new Map())
+      const hasDataRef = useRef(false)
+      const inflightRef = useRef(false)
+      const pausedRef = useRef(false)
       const mountedRef = useRef(true)
 
       useEffect(() => {
@@ -929,15 +933,27 @@ window.__ModuleLoader__.load({
           setError(new Error('missing-session'))
           return
         }
-        try {
-          abortRef.current?.abort()
-        } catch {
-          /* ignore */
-        }
+        // A slow read must be allowed to finish. The previous version aborted
+        // the in-flight request on every three-second poll, so a tree that took
+        // longer than the interval never produced a result and the panel spun
+        // forever.
+        if (inflightRef.current) return
+        inflightRef.current = true
         const controller = new AbortController()
         abortRef.current = controller
+        let timedOut = false
+        const timeoutId = window.setTimeout(() => {
+          timedOut = true
+          try {
+            controller.abort()
+          } catch {
+            /* ignore */
+          }
+        }, 5000)
         setStatus((previous) =>
-          previous === 'ready' || previous === 'refreshing' ? 'refreshing' : 'loading',
+          previous === 'ready' || previous === 'refreshing' || previous === 'timeout'
+            ? 'refreshing'
+            : 'loading',
         )
         setError(null)
         try {
@@ -946,30 +962,155 @@ window.__ModuleLoader__.load({
             { signal: controller.signal },
           )
           if (!mountedRef.current) return
+          pausedRef.current = false
+          const nextNodes = Array.isArray(payload?.nodes) ? payload.nodes : []
+          const nextRoot = typeof payload?.rootId === 'string' ? payload.rootId : sessionId
           setData(payload)
+          if (!hasDataRef.current) {
+            hasDataRef.current = true
+            setBranches({ [nextRoot]: nextNodes })
+            setExpanded({ [nextRoot]: true })
+            setBranchErrors({})
+            setBranchLoading({})
+          } else {
+            // A poll refreshes only the root level. Branches that are already
+            // expanded stay as the user left them instead of re-reading every
+            // cold descendant catalog every five seconds.
+            setBranches((previous) => ({ ...previous, [nextRoot]: nextNodes }))
+          }
           setStatus('ready')
         } catch (failure) {
-          if (failure?.name === 'AbortError') return
+          if (failure?.name === 'AbortError') {
+            if (!timedOut || !mountedRef.current) return
+            // Do not retry a visibly stuck read forever: show "none" at once
+            // and wait for an explicit refresh.
+            pausedRef.current = true
+            setStatus('timeout')
+            setError(new Error('team-timeout'))
+            return
+          }
           if (!mountedRef.current) return
           setError(failure)
           setStatus('error')
+        } finally {
+          window.clearTimeout(timeoutId)
+          inflightRef.current = false
+          if (abortRef.current === controller) abortRef.current = null
         }
       }, [sessionId])
+
+      const refreshTeam = useCallback(() => {
+        pausedRef.current = false
+        hasDataRef.current = false
+        setExpanded({})
+        setBranchErrors({})
+        setBranchLoading({})
+        for (const controller of branchAbortRef.current.values()) {
+          try {
+            controller.abort()
+          } catch {
+            /* ignore */
+          }
+        }
+        branchAbortRef.current.clear()
+        // Keep the last tree visible until the new root response replaces it;
+        // the reload clears the now-stale deeper branches itself.
+        void load()
+      }, [load])
+
+      const toggleBranch = useCallback(
+        (node) => {
+          const id = typeof node?.id === 'string' ? node.id : ''
+          if (id === '') return
+          if (expanded[id] === true) {
+            setExpanded((previous) => ({ ...previous, [id]: false }))
+            return
+          }
+          if (Array.isArray(branches[id])) {
+            setExpanded((previous) => ({ ...previous, [id]: true }))
+            return
+          }
+          // The Map is the synchronous guard: two clicks in the same render
+          // both see the old `branchLoading` state.
+          if (branchAbortRef.current.has(id)) return
+          setBranchLoading((previous) => ({ ...previous, [id]: true }))
+          setBranchErrors((previous) => {
+            if (previous[id] === undefined) return previous
+            const next = { ...previous }
+            delete next[id]
+            return next
+          })
+          const controller = new AbortController()
+          branchAbortRef.current.set(id, controller)
+          let timedOut = false
+          const timeoutId = window.setTimeout(() => {
+            timedOut = true
+            try {
+              controller.abort()
+            } catch {
+              /* ignore */
+            }
+          }, 8000)
+          getJson(
+            `${API_TEAM}?sessionId=${encodeURIComponent(sessionId)}&parentId=${encodeURIComponent(id)}`,
+            { signal: controller.signal },
+          )
+            .then((payload) => {
+              if (!mountedRef.current) return
+              const children = Array.isArray(payload?.nodes) ? payload.nodes : []
+              setBranches((previous) => ({ ...previous, [id]: children }))
+              setExpanded((previous) => ({ ...previous, [id]: true }))
+            })
+            .catch((failure) => {
+              if (failure?.name === 'AbortError') {
+                if (!timedOut || !mountedRef.current) return
+                setBranchErrors((previous) => ({ ...previous, [id]: t('team.timeout') }))
+                return
+              }
+              if (!mountedRef.current) return
+              setBranchErrors((previous) => ({ ...previous, [id]: describeError(failure) }))
+            })
+            .finally(() => {
+              window.clearTimeout(timeoutId)
+              if (branchAbortRef.current.get(id) === controller) {
+                branchAbortRef.current.delete(id)
+              }
+              if (!mountedRef.current) return
+              setBranchLoading((previous) => {
+                if (previous[id] !== true) return previous
+                const next = { ...previous }
+                delete next[id]
+                return next
+              })
+            })
+        },
+        [branches, expanded, sessionId],
+      )
 
       useEffect(() => {
         if (!open) return undefined
         measure()
+        pausedRef.current = false
         void load()
         const timer = window.setInterval(() => {
-          void load()
-        }, 3000)
+          if (!pausedRef.current) void load()
+        }, 5000)
         return () => {
           window.clearInterval(timer)
+          inflightRef.current = false
           try {
             abortRef.current?.abort()
           } catch {
             /* ignore */
           }
+          for (const controller of branchAbortRef.current.values()) {
+            try {
+              controller.abort()
+            } catch {
+              /* ignore */
+            }
+          }
+          branchAbortRef.current.clear()
         }
       }, [open, load, measure])
 
@@ -1006,29 +1147,44 @@ window.__ModuleLoader__.load({
         h('span', { className: 'asa-team-button-label' }, t('team.button')),
       )
 
-      const nodes = Array.isArray(data?.nodes) ? data.nodes : []
-      const byParent = teamChildrenMap(nodes)
-      const running = nodes.filter((node) => node.kind === 'child' && node.activity === 'running').length
-      const total = nodes.filter((node) => node.kind === 'child').length
+      const loadedNodes = []
+      const seenNodes = new Set()
+      for (const list of Object.values(branches)) {
+        if (!Array.isArray(list)) continue
+        for (const node of list) {
+          if (!node || typeof node.id !== 'string' || seenNodes.has(node.id)) continue
+          seenNodes.add(node.id)
+          loadedNodes.push(node)
+        }
+      }
+      const running = loadedNodes.filter((node) => node.kind === 'child' && node.activity === 'running').length
+      const total = loadedNodes.filter((node) => node.kind === 'child').length
       const currentId = data?.currentId ?? sessionId
       const rootId = data?.rootId ?? sessionId
       const rootLabel = data?.rootTitle || (rootId === currentId ? t('team.currentSession') : t('team.main'))
-      const rootChildren = [
-        ...(byParent.get(rootId) ?? []),
-        ...(byParent.get('__root__') ?? []),
-      ]
+      const rootChildren = Array.isArray(branches[rootId]) ? branches[rootId] : []
 
       const renderNode = (node, depth) => {
         if (depth > 32) return null
-        const children = byParent.get(node.id) ?? []
-        const isCurrent = node.id === currentId
+        const id = typeof node?.id === 'string' ? node.id : ''
+        if (id === '') return null
+        const children = Array.isArray(branches[id]) ? branches[id] : null
+        const loaded = children !== null
+        const isOpen = expanded[id] === true && loaded
+        const isLoading = branchLoading[id] === true
+        const branchError = branchErrors[id]
+        const isCurrent = id === currentId
         const isRunning = node.activity === 'running'
         const diagnostic = node.kind === 'diagnostic'
-        const label = node.label || node.name || shortId(node.id)
+        const expandable = !diagnostic && node.mode !== 'external'
+        const label = node.label || node.name || shortId(id)
+        const meta = diagnostic
+          ? t('team.diagnostic', { reason: node.reason ?? '' })
+          : `${node.mode || 'unknown'} · ${shortId(id)}`
         return h(
           'li',
           {
-            key: node.id,
+            key: id,
             className: 'asa-team-node',
             'data-diagnostic': diagnostic ? 'true' : 'false',
           },
@@ -1037,25 +1193,44 @@ window.__ModuleLoader__.load({
             {
               className: 'asa-team-row',
               'data-current': isCurrent ? 'true' : 'false',
-              title: node.path || node.id,
+              title: node.path || id,
             },
+            expandable
+              ? h(
+                  'button',
+                  {
+                    type: 'button',
+                    className: 'asa-team-toggle',
+                    'aria-expanded': isOpen ? 'true' : 'false',
+                    'aria-label': isOpen ? t('team.collapse') : t('team.expand'),
+                    title: isOpen ? t('team.collapse') : t('team.expand'),
+                    onClick: (event) => {
+                      event.preventDefault()
+                      event.stopPropagation()
+                      toggleBranch(node)
+                    },
+                  },
+                  icon('chevron', 12),
+                )
+              : h('span', { className: 'asa-team-toggle asa-team-toggle-empty' }),
             h('span', {
               className: `asa-team-dot ${isRunning ? 'asa-team-dot-running' : 'asa-team-dot-idle'}`,
               'aria-label': isRunning ? t('team.running') : t('team.idle'),
             }),
             h('span', { className: 'asa-team-name' }, label),
             isCurrent ? h('span', { className: 'asa-team-current' }, t('team.current')) : null,
-            diagnostic
-              ? h(
-                  'span',
-                  { className: 'asa-team-meta asa-team-warn' },
-                  t('team.diagnostic', { reason: node.reason ?? '' }),
-                )
-              : h('span', { className: 'asa-team-meta' }, `${node.mode || 'unknown'} · ${shortId(node.id)}`),
-            children.length > 0 ? h('span', { className: 'asa-team-count' }, String(children.length)) : null,
+            h('span', { className: `asa-team-meta${diagnostic ? ' asa-team-warn' : ''}` }, meta),
+            loaded && children.length > 0
+              ? h('span', { className: 'asa-team-count' }, String(children.length))
+              : null,
           ),
-          children.length > 0
+          isLoading ? h('div', { className: 'asa-team-branch-loading' }, t('team.loading')) : null,
+          branchError ? h('div', { className: 'asa-team-branch-error' }, branchError) : null,
+          isOpen && children.length > 0
             ? h('ul', { className: 'asa-team-branch' }, children.map((child) => renderNode(child, depth + 1)))
+            : null,
+          isOpen && children.length === 0
+            ? h('div', { className: 'asa-team-branch-empty' }, t('team.emptyBranch'))
             : null,
         )
       }
@@ -1091,9 +1266,7 @@ window.__ModuleLoader__.load({
           h(IconButton, {
             iconName: 'refresh',
             label: t('team.refresh'),
-            onClick: () => {
-              void load()
-            },
+            onClick: refreshTeam,
             disabled: status === 'loading' || status === 'refreshing',
           }),
           h(IconButton, {
@@ -1105,8 +1278,16 @@ window.__ModuleLoader__.load({
         h(
           'div',
           { className: 'asa-team-body' },
-          status === 'loading' && data === null
+          (status === 'loading' || status === 'refreshing') && data === null
             ? h('div', { className: 'asa-team-state' }, t('team.loading'))
+            : null,
+          status === 'timeout' && data === null
+            ? h(
+                'div',
+                { className: 'asa-team-state' },
+                h('span', { className: 'asa-team-error-title' }, t('team.timeout')),
+                h(Button, { label: t('team.retry'), onClick: refreshTeam }),
+              )
             : null,
           status === 'error' && data === null
             ? h(
@@ -1114,12 +1295,7 @@ window.__ModuleLoader__.load({
                 { className: 'asa-team-state asa-team-error' },
                 h('span', { className: 'asa-team-error-title' }, t('team.error')),
                 error ? h('span', { className: 'asa-team-error-detail' }, describeError(error)) : null,
-                h(Button, {
-                  label: t('team.retry'),
-                  onClick: () => {
-                    void load()
-                  },
-                }),
+                h(Button, { label: t('team.retry'), onClick: refreshTeam }),
               )
             : null,
           data !== null
@@ -1147,7 +1323,7 @@ window.__ModuleLoader__.load({
                   ? h(
                       'div',
                       { className: 'asa-team-truncated' },
-                      t('team.truncated', { count: nodes.length }),
+                      t('team.truncated', { count: loadedNodes.length }),
                     )
                   : null,
               )
@@ -3024,6 +3200,16 @@ window.__ModuleLoader__.load({
 .asa-team-row { display:flex; align-items:center; gap:6px; min-width:0; padding:4px 6px; border-radius:6px; }
 .asa-team-row:hover { background:var(--dsw-alias-bg-layer-2,#ececf1); }
 .asa-team-row[data-current="true"] { background:var(--dsw-alias-bg-layer-2,#ececf1); }
+.asa-team-toggle { display:inline-flex; align-items:center; justify-content:center; width:16px; height:16px;
+  flex:none; padding:0; border:none; border-radius:4px; background:none;
+  color:var(--dsw-alias-label-secondary,#6b6b76); cursor:pointer; -webkit-app-region:no-drag; }
+.asa-team-toggle:hover { background:var(--dsw-alias-bg-layer-2,#ececf1); color:var(--dsw-alias-label-primary,#1b1b1f); }
+.asa-team-toggle svg { transition:transform .12s ease; }
+.asa-team-toggle[aria-expanded="true"] svg { transform:rotate(90deg); }
+.asa-team-toggle-empty { visibility:hidden; }
+.asa-team-branch-loading, .asa-team-branch-empty, .asa-team-branch-error {
+  margin:0 0 2px 22px; font-size:10.5px; line-height:1.5; color:var(--dsw-alias-label-secondary,#6b6b76); }
+.asa-team-branch-error { color:var(--dsw-alias-state-error-primary,#c0392b); }
 .asa-team-dot { flex:none; width:7px; height:7px; border-radius:50%; }
 .asa-team-dot-running { background:var(--dsw-alias-state-success-primary,#2e8b57); }
 .asa-team-dot-idle { background:var(--dsw-alias-state-idle-primary,#8a8a95); }

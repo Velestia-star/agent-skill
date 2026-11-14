@@ -1229,6 +1229,28 @@ export function apply(ctx) {
     }
   }
 
+  /**
+   * Read one session's direct subagent catalog. The child catalog is a session
+   * projection: a live parent answers from memory, while a cold parent pays for
+   * its own log only when the user expands that branch. Walking the whole tree
+   * eagerly is what made the panel take seconds for a long-lived conversation.
+   */
+  const readSubagentChildren = async (sessionQuery, sessionId) => {
+    const observation = await sessionQuery.observeSession(sessionId)
+    try {
+      const catalog = observation?.projections?.values?.subagentCatalog
+      if (catalog === undefined) throw new Error('subagent catalog projection unavailable')
+      return Array.isArray(catalog) ? catalog : []
+    } finally {
+      try {
+        const dispose = Symbol.dispose === undefined ? undefined : observation?.[Symbol.dispose]
+        if (typeof dispose === 'function') dispose.call(observation)
+      } catch {
+        /* observation cleanup is best effort */
+      }
+    }
+  }
+
   const handleTeam = async (request, response) => {
     if (!methodAllowed(request, response, ['GET', 'HEAD'])) return
     const url = requestUrl(request)
@@ -1237,14 +1259,13 @@ export function apply(ctx) {
       sendJson(request, response, 400, { error: 'session-required' })
       return
     }
-    const subagents = useService(ctx, 'subagents')
-    if (!subagents || typeof subagents.listDescendants !== 'function') {
+    const sessionQuery = useService(ctx, 'sessionQuery')
+    if (!sessionQuery || typeof sessionQuery.observeSession !== 'function') {
       sendJson(request, response, 503, { error: 'team-unavailable' })
       return
     }
-    const sessionQuery = useService(ctx, 'sessionQuery')
     let rootId = sessionId
-    if (sessionQuery && typeof sessionQuery.traceSession === 'function') {
+    if (typeof sessionQuery.traceSession === 'function') {
       try {
         const trace = await sessionQuery.traceSession(sessionId)
         if (trace?.complete === true) {
@@ -1255,47 +1276,54 @@ export function apply(ctx) {
         /* fall back to the current session */
       }
     }
+    const requestedParent = (url?.searchParams.get('parentId') ?? '').trim()
+    const parentId = requestedParent === '' ? rootId : requestedParent
     let entries
     try {
-      entries = await subagents.listDescendants(rootId)
+      entries = await readSubagentChildren(sessionQuery, parentId)
     } catch (error) {
       logWarn(`team list failed: ${error instanceof Error ? error.message : String(error)}`)
       sendJson(request, response, 500, { error: 'team-unavailable' })
       return
     }
+    const sessions = useService(ctx, 'sessions')
+    const isLive = (id) => {
+      try {
+        return sessions?.get?.(id) !== undefined
+      } catch {
+        return false
+      }
+    }
     const rows = Array.isArray(entries) ? entries : []
     const nodes = rows
       .slice(0, MAX_TEAM_NODES)
-      .map((entry) => ({
-        id: String(entry?.id ?? ''),
-        parentId: typeof entry?.parentId === 'string' ? entry.parentId : undefined,
-        depth: Number.isFinite(entry?.depth) ? entry.depth : 1,
-        path: typeof entry?.path === 'string' ? entry.path : undefined,
-        kind: entry?.kind === 'diagnostic' ? 'diagnostic' : 'child',
-        activity: entry?.activity === 'running' ? 'running' : 'inactive',
-        mode: typeof entry?.mode === 'string' ? entry.mode : 'unknown',
-        label: typeof entry?.label === 'string' ? entry.label : undefined,
-        name: typeof entry?.name === 'string' ? entry.name : undefined,
-        hasChildren: entry?.hasChildren === true,
-        reason: typeof entry?.reason === 'string' ? entry.reason : undefined,
-      }))
+      .map((entry) => {
+        const id = String(entry?.id ?? '')
+        const activity =
+          entry?.activity === 'running' || entry?.activity === 'inactive'
+            ? entry.activity
+            : isLive(id)
+              ? 'running'
+              : 'inactive'
+        return {
+          id,
+          parentId,
+          depth: 1,
+          path: typeof entry?.path === 'string' ? entry.path : undefined,
+          kind: entry?.kind === 'diagnostic' ? 'diagnostic' : 'child',
+          activity,
+          mode: typeof entry?.mode === 'string' ? entry.mode : 'unknown',
+          label: typeof entry?.label === 'string' ? entry.label : undefined,
+          name: typeof entry?.name === 'string' ? entry.name : undefined,
+          hasChildren: entry?.hasChildren === true,
+          reason: typeof entry?.reason === 'string' ? entry.reason : undefined,
+        }
+      })
       .filter((node) => node.id !== '')
-    let rootTitle
-    if (sessionQuery && typeof sessionQuery.readTitle === 'function') {
-      try {
-        const snapshot = await sessionQuery.readTitle(rootId)
-        // `readTitle` and `readTitleSnapshots` both wrap the string once more.
-        const value =
-          typeof snapshot?.title === 'string' ? snapshot.title : snapshot?.title?.title
-        if (typeof value === 'string' && value.trim() !== '') rootTitle = value.trim()
-      } catch {
-        /* the title is optional */
-      }
-    }
     sendJson(request, response, 200, {
       rootId,
       currentId: sessionId,
-      rootTitle,
+      parentId,
       nodes,
       truncated: rows.length > MAX_TEAM_NODES,
       updatedAt: Date.now(),
