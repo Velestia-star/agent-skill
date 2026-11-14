@@ -796,7 +796,27 @@ window.__ModuleLoader__.load({
         }
       }, [load])
 
-      return { ...state, reload: load }
+      /**
+       * Apply an authoritative slice (a reorder response) without re-reading the
+       * whole state. The full `/state` read walks the session corpus and up to
+       * 200 title snapshots, which is far too slow to sit between a drop and the
+       * next gesture.
+       */
+      const patch = useCallback((updater) => {
+        setState((previous) => {
+          if (!previous.data) return previous
+          let next
+          try {
+            next = updater(previous.data)
+          } catch {
+            return previous
+          }
+          if (!next || next === previous.data) return previous
+          return { ...previous, data: next }
+        })
+      }, [])
+
+      return { ...state, reload: load, patch }
     }
 
     function useModelEfforts(provider, model) {
@@ -2235,21 +2255,32 @@ window.__ModuleLoader__.load({
         const insert = Math.max(0, Math.min(gap, others.length))
         const ordered = [...others.slice(0, insert), dragged, ...others.slice(insert)]
         if (ordered.every((item, index) => item === items[index])) return
-        // The lock covers the write *and* the re-read: nothing else can start in
-        // between, so the list is never shown against a superseded order.
+        // The lock covers the write *and* the local apply: nothing else can
+        // start in between, so the list is never shown against a superseded
+        // order. The full `/state` re-read is deliberately avoided here — it
+        // walks the session corpus and up to 200 title snapshots, which made a
+        // drop look frozen for seconds while holding the write lock.
+        const field = kind === 'agent' ? 'agents' : 'skills'
+        const previousOrder = items
         await runExclusive(async () => {
+          const host = hostRef.current
+          const applyOrder = (nextItems) => {
+            host.patch((snapshot) => ({ ...snapshot, [field]: nextItems }))
+          }
+          // Keep the dropped card where the user left it while the local write
+          // is in flight; the response below is the final authority.
+          applyOrder(ordered)
           try {
-            // No optimistic update: the Host is the source of truth and the list
-            // is re-read from it after the write.
-            if (kind === 'agent') {
-              await postJson(API_AGENT_ARRANGE, { ids: ordered.map((item) => item.id) })
-            } else {
-              await postJson(API_SKILL_ARRANGE, { names: ordered.map((item) => item.name) })
-            }
-            await hostRef.current.reload()
+            const payload =
+              kind === 'agent'
+                ? await postJson(API_AGENT_ARRANGE, { ids: ordered.map((item) => item.id) })
+                : await postJson(API_SKILL_ARRANGE, { names: ordered.map((item) => item.name) })
+            const confirmed = kind === 'agent' ? payload?.agents : payload?.skills
+            applyOrder(Array.isArray(confirmed) && confirmed.length > 0 ? confirmed : ordered)
           } catch (error) {
+            applyOrder(previousOrder)
             if (mountedRef.current) showToast(describeError(error))
-            await hostRef.current.reload()
+            await host.reload()
           }
         })
       }
@@ -2436,11 +2467,17 @@ window.__ModuleLoader__.load({
         setAgentError(null)
         await runExclusive(async () => {
           try {
-            await postJson(API_AGENT_SAVE, agentEditor.draft)
+            const payload = await postJson(API_AGENT_SAVE, agentEditor.draft)
             if (!mountedRef.current) return
             setAgentEditor(null)
             showToast(t('toast.savedAgent'))
-            await host.reload()
+            // The save response already carries the authoritative list; do not
+            // re-read the whole state just to show the new card.
+            if (Array.isArray(payload?.agents)) {
+              host.patch((snapshot) => ({ ...snapshot, agents: payload.agents }))
+            } else {
+              await host.reload()
+            }
           } catch (error) {
             if (mountedRef.current) setAgentError(describeError(error))
           }
@@ -2485,11 +2522,15 @@ window.__ModuleLoader__.load({
         setSkillError(null)
         await runExclusive(async () => {
           try {
-            await postJson(API_SKILL_SAVE, payload)
+            const result = await postJson(API_SKILL_SAVE, payload)
             if (!mountedRef.current) return
             setSkillEditor(null)
             showToast(t('toast.savedSkill'))
-            await host.reload()
+            if (Array.isArray(result?.skills)) {
+              host.patch((snapshot) => ({ ...snapshot, skills: result.skills }))
+            } else {
+              await host.reload()
+            }
           } catch (error) {
             if (mountedRef.current) setSkillError(describeError(error))
           }
@@ -2500,11 +2541,15 @@ window.__ModuleLoader__.load({
         if (sortRef.current !== null) return
         await runExclusive(async () => {
           try {
-            await postJson(API_AGENT_DELETE, { id: agent.id })
+            const payload = await postJson(API_AGENT_DELETE, { id: agent.id })
             if (!mountedRef.current) return
             setConfirm(null)
             showToast(t('toast.deletedAgent'))
-            await host.reload()
+            if (Array.isArray(payload?.agents)) {
+              host.patch((snapshot) => ({ ...snapshot, agents: payload.agents }))
+            } else {
+              await host.reload()
+            }
           } catch (error) {
             if (mountedRef.current) showToast(describeError(error))
           }
@@ -2515,11 +2560,15 @@ window.__ModuleLoader__.load({
         if (sortRef.current !== null) return
         await runExclusive(async () => {
           try {
-            await postJson(API_SKILL_DELETE, { name: skill.name, path: skill.path })
+            const payload = await postJson(API_SKILL_DELETE, { name: skill.name, path: skill.path })
             if (!mountedRef.current) return
             setConfirm(null)
             showToast(t('toast.deletedSkill'))
-            await host.reload()
+            if (Array.isArray(payload?.skills)) {
+              host.patch((snapshot) => ({ ...snapshot, skills: payload.skills }))
+            } else {
+              await host.reload()
+            }
           } catch (error) {
             if (mountedRef.current) showToast(describeError(error))
           }
