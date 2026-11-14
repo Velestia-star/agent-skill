@@ -9,6 +9,7 @@ window.__ModuleLoader__.load({
     const NS = 'dsh-agent-skill'
     const API_STATE = '/api/dsh-agent-skill/state'
     const API_MODEL = '/api/dsh-agent-skill/model'
+    const API_TEAM = '/api/dsh-agent-skill/team'
     const API_AGENT_SAVE = '/api/dsh-agent-skill/agents/save'
     const API_AGENT_DELETE = '/api/dsh-agent-skill/agents/delete'
     const API_AGENT_ARRANGE = '/api/dsh-agent-skill/agents/arrange'
@@ -28,6 +29,24 @@ window.__ModuleLoader__.load({
       'panel.callhint': '调用方式',
       'panel.copyHint': '复制',
       'panel.copyTemplate': 'delegate_agent(agent: "<名称>", prompt: "…")',
+      'team.button': '智能体团队',
+      'team.title': '智能体团队',
+      'team.summary': '{running} 工作中 · {total} 个',
+      'team.running': '工作中',
+      'team.idle': '空闲',
+      'team.current': '当前',
+      'team.currentSession': '当前会话',
+      'team.main': '主会话',
+      'team.empty': '当前对话还没有子智能体。',
+      'team.error': '读取智能体团队失败',
+      'team.retry': '重试',
+      'team.loading': '读取中…',
+      'team.truncated': '节点较多，只显示前 {count} 个。',
+      'team.close': '关闭',
+      'team.refresh': '刷新',
+      'team.diagnostic': '目录异常：{reason}',
+      'error.missing-session': '拿不到当前会话 ID。',
+      'error.team-unavailable': '智能体团队暂时读不到，稍后重试。',
       'panel.sortHint': '拖动排序',
       'panel.sortSlot': '放到这里',
       'panel.copied': '已复制',
@@ -182,6 +201,24 @@ window.__ModuleLoader__.load({
       'panel.callhint': 'Call',
       'panel.copyHint': 'Copy',
       'panel.copyTemplate': 'delegate_agent(agent: "<name>", prompt: "…")',
+      'team.button': 'Agent team',
+      'team.title': 'Agent team',
+      'team.summary': '{running} running · {total} total',
+      'team.running': 'Running',
+      'team.idle': 'Idle',
+      'team.current': 'Current',
+      'team.currentSession': 'Current conversation',
+      'team.main': 'Main conversation',
+      'team.empty': 'No subagents in this conversation yet.',
+      'team.error': 'Could not read the agent team',
+      'team.retry': 'Retry',
+      'team.loading': 'Loading…',
+      'team.truncated': 'Only the first {count} nodes are shown.',
+      'team.close': 'Close',
+      'team.refresh': 'Refresh',
+      'team.diagnostic': 'Catalog error: {reason}',
+      'error.missing-session': 'Could not resolve the current session id.',
+      'error.team-unavailable': 'The agent team is unavailable right now.',
       'panel.sortHint': 'Drag to arrange',
       'panel.sortSlot': 'Drop here',
       'panel.copied': 'Copied',
@@ -382,6 +419,11 @@ window.__ModuleLoader__.load({
       return '…' + value.slice(value.length - limit + 1)
     }
 
+    function shortId(value) {
+      const text = String(value ?? '')
+      return text.length <= 10 ? text : text.slice(0, 8)
+    }
+
     function byteLength(value) {
       const text = String(value ?? '')
       try {
@@ -400,8 +442,11 @@ window.__ModuleLoader__.load({
       return raw === '' ? t('error.request-failed') : raw
     }
 
-    async function getJson(url) {
-      const response = await fetch(url, { headers: { accept: 'application/json' } })
+    async function getJson(url, options = {}) {
+      const response = await fetch(url, {
+        headers: { accept: 'application/json' },
+        ...(options && options.signal !== undefined ? { signal: options.signal } : {}),
+      })
       const payload = await response.json().catch(() => ({}))
       if (!response.ok) throw new Error(payload?.error || `http-${response.status}`)
       return payload
@@ -474,6 +519,12 @@ window.__ModuleLoader__.load({
           h('circle', { key: 'd', cx: '15', cy: '12', r: '1.2', fill: 'currentColor', stroke: 'none' }),
           h('circle', { key: 'e', cx: '9', cy: '17', r: '1.2', fill: 'currentColor', stroke: 'none' }),
           h('circle', { key: 'f', cx: '15', cy: '17', r: '1.2', fill: 'currentColor', stroke: 'none' }),
+        ],
+        teamTree: [
+          h('circle', { key: 'a', cx: '12', cy: '5', r: '2' }),
+          h('circle', { key: 'b', cx: '6', cy: '19', r: '2' }),
+          h('circle', { key: 'c', cx: '18', cy: '19', r: '2' }),
+          h('path', { key: 'd', d: 'M12 7v4M6 17v-3h12v3' }),
         ],
       }
       return h('svg', common, paths[name] ?? paths.dot)
@@ -777,6 +828,317 @@ window.__ModuleLoader__.load({
         }
       }, [provider, model])
       return result
+    }
+
+    /* ----------------------------------------------------------- team tree */
+
+    function teamChildrenMap(nodes) {
+      const byParent = new Map()
+      const ids = new Set(nodes.map((node) => node.id))
+      for (const node of nodes) {
+        const parent = node.parentId && ids.has(node.parentId) ? node.parentId : '__root__'
+        const list = byParent.get(parent) ?? []
+        list.push(node)
+        byParent.set(parent, list)
+      }
+      return byParent
+    }
+
+    function AgentTeamButton(props) {
+      const sessionId = typeof props?.sessionId === 'string' ? props.sessionId : ''
+      const [open, setOpen] = useState(false)
+      const [status, setStatus] = useState('idle')
+      const [data, setData] = useState(null)
+      const [error, setError] = useState(null)
+      const [anchor, setAnchor] = useState(null)
+      const buttonRef = useRef(null)
+      const dialogRef = useRef(null)
+      const abortRef = useRef(null)
+      const mountedRef = useRef(true)
+
+      useEffect(() => {
+        mountedRef.current = true
+        return () => {
+          mountedRef.current = false
+          try {
+            abortRef.current?.abort()
+          } catch {
+            /* ignore */
+          }
+        }
+      }, [])
+
+      // A native modal dialog lives in the browser's top layer, so the panel
+      // escapes the header's clipping without a portal package.
+      useEffect(() => {
+        const node = dialogRef.current
+        if (!node) return
+        if (open) {
+          if (!node.open) {
+            try {
+              node.showModal()
+            } catch {
+              node.setAttribute('open', '')
+            }
+          }
+        } else if (node.open) {
+          try {
+            node.close()
+          } catch {
+            node.removeAttribute('open')
+          }
+        }
+      }, [open])
+
+      const measure = useCallback(() => {
+        const node = buttonRef.current
+        if (!node || typeof window === 'undefined') return
+        const rect = node.getBoundingClientRect()
+        const width = Math.max(280, Math.min(420, window.innerWidth - 24))
+        setAnchor({
+          top: Math.max(8, Math.min(rect.bottom + 6, window.innerHeight - 220)),
+          right: Math.max(12, window.innerWidth - rect.right),
+          width,
+          maxHeight: Math.max(180, Math.min(window.innerHeight * 0.62, window.innerHeight - rect.bottom - 24)),
+        })
+      }, [])
+
+      const load = useCallback(async () => {
+        if (sessionId === '') {
+          setStatus('error')
+          setError(new Error('missing-session'))
+          return
+        }
+        try {
+          abortRef.current?.abort()
+        } catch {
+          /* ignore */
+        }
+        const controller = new AbortController()
+        abortRef.current = controller
+        setStatus((previous) =>
+          previous === 'ready' || previous === 'refreshing' ? 'refreshing' : 'loading',
+        )
+        setError(null)
+        try {
+          const payload = await getJson(
+            `${API_TEAM}?sessionId=${encodeURIComponent(sessionId)}`,
+            { signal: controller.signal },
+          )
+          if (!mountedRef.current) return
+          setData(payload)
+          setStatus('ready')
+        } catch (failure) {
+          if (failure?.name === 'AbortError') return
+          if (!mountedRef.current) return
+          setError(failure)
+          setStatus('error')
+        }
+      }, [sessionId])
+
+      useEffect(() => {
+        if (!open) return undefined
+        measure()
+        void load()
+        const timer = window.setInterval(() => {
+          void load()
+        }, 3000)
+        return () => {
+          window.clearInterval(timer)
+          try {
+            abortRef.current?.abort()
+          } catch {
+            /* ignore */
+          }
+        }
+      }, [open, load, measure])
+
+      useEffect(() => {
+        if (!open) return undefined
+        const onResize = () => measure()
+        window.addEventListener('resize', onResize)
+        window.addEventListener('scroll', onResize, true)
+        return () => {
+          window.removeEventListener('resize', onResize)
+          window.removeEventListener('scroll', onResize, true)
+        }
+      }, [open, measure])
+
+      const button = h(
+        'button',
+        {
+          ref: buttonRef,
+          type: 'button',
+          className: 'asa-team-button',
+          'aria-haspopup': 'dialog',
+          'aria-expanded': open ? 'true' : 'false',
+          title: t('team.button'),
+          onClick: () => {
+            if (open) {
+              setOpen(false)
+              return
+            }
+            measure()
+            setOpen(true)
+          },
+        },
+        icon('teamTree', 14),
+        h('span', { className: 'asa-team-button-label' }, t('team.button')),
+      )
+
+      const nodes = Array.isArray(data?.nodes) ? data.nodes : []
+      const byParent = teamChildrenMap(nodes)
+      const running = nodes.filter((node) => node.kind === 'child' && node.activity === 'running').length
+      const total = nodes.filter((node) => node.kind === 'child').length
+      const currentId = data?.currentId ?? sessionId
+      const rootId = data?.rootId ?? sessionId
+      const rootLabel = data?.rootTitle || (rootId === currentId ? t('team.currentSession') : t('team.main'))
+      const rootChildren = [
+        ...(byParent.get(rootId) ?? []),
+        ...(byParent.get('__root__') ?? []),
+      ]
+
+      const renderNode = (node, depth) => {
+        if (depth > 32) return null
+        const children = byParent.get(node.id) ?? []
+        const isCurrent = node.id === currentId
+        const isRunning = node.activity === 'running'
+        const diagnostic = node.kind === 'diagnostic'
+        const label = node.label || node.name || shortId(node.id)
+        return h(
+          'li',
+          {
+            key: node.id,
+            className: 'asa-team-node',
+            'data-diagnostic': diagnostic ? 'true' : 'false',
+          },
+          h(
+            'div',
+            {
+              className: 'asa-team-row',
+              'data-current': isCurrent ? 'true' : 'false',
+              title: node.path || node.id,
+            },
+            h('span', {
+              className: `asa-team-dot ${isRunning ? 'asa-team-dot-running' : 'asa-team-dot-idle'}`,
+              'aria-label': isRunning ? t('team.running') : t('team.idle'),
+            }),
+            h('span', { className: 'asa-team-name' }, label),
+            isCurrent ? h('span', { className: 'asa-team-current' }, t('team.current')) : null,
+            diagnostic
+              ? h(
+                  'span',
+                  { className: 'asa-team-meta asa-team-warn' },
+                  t('team.diagnostic', { reason: node.reason ?? '' }),
+                )
+              : h('span', { className: 'asa-team-meta' }, `${node.mode || 'unknown'} · ${shortId(node.id)}`),
+            children.length > 0 ? h('span', { className: 'asa-team-count' }, String(children.length)) : null,
+          ),
+          children.length > 0
+            ? h('ul', { className: 'asa-team-branch' }, children.map((child) => renderNode(child, depth + 1)))
+            : null,
+        )
+      }
+
+      const panel = h(
+        'dialog',
+        {
+          ref: dialogRef,
+          className: 'asa-team-panel asa-team-dialog',
+          'aria-label': t('team.title'),
+          onClick: (event) => {
+            if (event.target === event.currentTarget) setOpen(false)
+          },
+          onCancel: (event) => {
+            event.preventDefault()
+            setOpen(false)
+          },
+          style: anchor
+            ? {
+                top: `${anchor.top}px`,
+                right: `${anchor.right}px`,
+                width: `${anchor.width}px`,
+                maxHeight: `${anchor.maxHeight}px`,
+              }
+            : { top: '64px', right: '16px', width: '380px', maxHeight: '60vh' },
+        },
+        h(
+          'div',
+          { className: 'asa-team-head' },
+          h('span', { className: 'asa-team-head-icon' }, icon('teamTree', 14)),
+          h('span', { className: 'asa-team-head-title' }, t('team.title')),
+          h('span', { className: 'asa-team-summary' }, t('team.summary', { running, total })),
+          h(IconButton, {
+            iconName: 'refresh',
+            label: t('team.refresh'),
+            onClick: () => {
+              void load()
+            },
+            disabled: status === 'loading' || status === 'refreshing',
+          }),
+          h(IconButton, {
+            iconName: 'close',
+            label: t('team.close'),
+            onClick: () => setOpen(false),
+          }),
+        ),
+        h(
+          'div',
+          { className: 'asa-team-body' },
+          status === 'loading' && data === null
+            ? h('div', { className: 'asa-team-state' }, t('team.loading'))
+            : null,
+          status === 'error' && data === null
+            ? h(
+                'div',
+                { className: 'asa-team-state asa-team-error' },
+                h('span', { className: 'asa-team-error-title' }, t('team.error')),
+                error ? h('span', { className: 'asa-team-error-detail' }, describeError(error)) : null,
+                h(Button, {
+                  label: t('team.retry'),
+                  onClick: () => {
+                    void load()
+                  },
+                }),
+              )
+            : null,
+          data !== null
+            ? h(
+                'div',
+                { className: 'asa-team-tree-wrap' },
+                h(
+                  'div',
+                  { className: 'asa-team-root-row' },
+                  h('span', { className: 'asa-team-root-mark' }, icon('teamTree', 13)),
+                  h('span', { className: 'asa-team-name asa-team-root-name' }, rootLabel),
+                  rootId === currentId
+                    ? h('span', { className: 'asa-team-current' }, t('team.current'))
+                    : null,
+                  h('span', { className: 'asa-team-meta' }, shortId(rootId)),
+                ),
+                rootChildren.length > 0
+                  ? h(
+                      'ul',
+                      { className: 'asa-team-tree' },
+                      rootChildren.map((node) => renderNode(node, 1)),
+                    )
+                  : h('div', { className: 'asa-team-empty' }, t('team.empty')),
+                data.truncated
+                  ? h(
+                      'div',
+                      { className: 'asa-team-truncated' },
+                      t('team.truncated', { count: nodes.length }),
+                    )
+                  : null,
+              )
+            : null,
+          status === 'error' && data !== null
+            ? h('div', { className: 'asa-team-error asa-team-error-inline' }, t('team.error'))
+            : null,
+        ),
+      )
+
+      return h(React.Fragment, null, button, panel)
     }
 
     /* ---------------------------------------------------------- agent editor */
@@ -2572,6 +2934,64 @@ window.__ModuleLoader__.load({
 .asa-spinner { width:18px; height:18px; border-radius:50%; border:2px solid var(--dsw-alias-border-l2,#c9c9d2);
   border-top-color:var(--dsw-alias-brand-primary,#3b6ef5); animation:asa-spin .8s linear infinite; }
 @keyframes asa-spin { to { transform:rotate(360deg); } }
+.asa-team-button { display:inline-flex; align-items:center; gap:6px; height:28px; padding:0 9px; margin-right:2px;
+  border-radius:8px; border:1px solid transparent; background:transparent; color:var(--dsw-alias-label-secondary,#6b6b76);
+  font:inherit; font-size:12px; cursor:pointer; white-space:nowrap; flex:none; -webkit-app-region:no-drag; }
+.asa-team-button:hover { background:var(--dsw-alias-bg-layer-2,#ececf1); color:var(--dsw-alias-label-primary,#1b1b1f); }
+.asa-team-button[aria-expanded="true"] { background:var(--dsw-alias-bg-layer-2,#ececf1); color:var(--dsw-alias-label-primary,#1b1b1f); }
+.asa-team-button-label { line-height:1; }
+.asa-team-panel { position:fixed; z-index:80; display:flex; flex-direction:column; overflow:hidden;
+  border:1px solid var(--dsw-alias-border-l1,#e4e4ea); border-radius:12px; background:var(--dsw-alias-bg-overlay,#1b1b1f);
+  color:var(--dsw-alias-label-primary,#1b1b1f); box-shadow:0 12px 32px rgba(0,0,0,.28); -webkit-app-region:no-drag; }
+.asa-team-dialog { margin:0; inset:auto; padding:0; max-width:calc(100vw - 24px); }
+.asa-team-dialog:not([open]) { display:none; }
+.asa-team-dialog::backdrop { background:transparent; }
+.asa-team-panel:focus { outline:none; }
+.asa-team-head { flex:none; display:flex; align-items:center; gap:7px; padding:9px 10px;
+  border-bottom:1px solid var(--dsw-alias-border-l1,#e4e4ea); background:var(--dsw-alias-bg-layer-1,#f6f6f8); }
+.asa-team-head-icon { display:inline-flex; color:var(--dsw-alias-label-secondary,#6b6b76); }
+.asa-team-head-title { font-size:13px; font-weight:600; white-space:nowrap; }
+.asa-team-summary { flex:1; min-width:0; font-size:11px; color:var(--dsw-alias-label-secondary,#6b6b76);
+  white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.asa-team-body { flex:1; min-height:0; overflow-y:auto; overscroll-behavior:contain; padding:8px 8px 10px; }
+.asa-team-state { display:flex; flex-direction:column; align-items:flex-start; gap:8px; padding:14px 8px;
+  font-size:12px; color:var(--dsw-alias-label-secondary,#6b6b76); }
+.asa-team-error { color:var(--dsw-alias-state-error-primary,#c0392b); }
+.asa-team-error-title { font-weight:600; }
+.asa-team-error-detail { font-size:11px; word-break:break-word; }
+.asa-team-error-inline { margin-top:8px; padding:6px 8px; font-size:11px; }
+.asa-team-tree-wrap { min-height:0; }
+.asa-team-root-row { display:flex; align-items:center; gap:7px; padding:6px 7px; margin-bottom:4px;
+  border-bottom:1px solid var(--dsw-alias-border-l1,#e4e4ea); }
+.asa-team-root-mark { display:inline-flex; color:var(--dsw-alias-brand-primary,#3b6ef5); }
+.asa-team-root-name { font-weight:600; }
+.asa-team-tree { list-style:none; margin:0 0 0 6px; padding:0 0 0 12px;
+  border-left:1px solid var(--dsw-alias-border-l2,#c9c9d2); }
+.asa-team-branch { list-style:none; margin:0; padding:0 0 0 14px;
+  border-left:1px solid var(--dsw-alias-border-l2,#c9c9d2); }
+.asa-team-node { position:relative; padding-left:12px; }
+.asa-team-node::before { content:''; position:absolute; left:0; top:15px; width:11px;
+  border-top:1px solid var(--dsw-alias-border-l2,#c9c9d2); }
+.asa-team-row { display:flex; align-items:center; gap:6px; min-width:0; padding:4px 6px; border-radius:6px; }
+.asa-team-row:hover { background:var(--dsw-alias-bg-layer-2,#ececf1); }
+.asa-team-row[data-current="true"] { background:var(--dsw-alias-bg-layer-2,#ececf1); }
+.asa-team-dot { flex:none; width:7px; height:7px; border-radius:50%; }
+.asa-team-dot-running { background:var(--dsw-alias-state-success-primary,#2e8b57); }
+.asa-team-dot-idle { background:var(--dsw-alias-state-idle-primary,#8a8a95); }
+.asa-team-name { font-size:12px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.asa-team-current { flex:none; padding:0 5px; border-radius:999px; border:1px solid var(--dsw-alias-brand-primary,#3b6ef5);
+  color:var(--dsw-alias-brand-primary,#3b6ef5); font-size:10px; line-height:16px; }
+.asa-team-meta { margin-left:auto; font-size:10.5px; color:var(--dsw-alias-label-secondary,#6b6b76);
+  white-space:nowrap; overflow:hidden; text-overflow:ellipsis; max-width:52%; }
+.asa-team-warn { color:var(--dsw-alias-state-warn-primary,#a4760c); }
+.asa-team-count { flex:none; min-width:16px; height:16px; padding:0 4px; border-radius:999px;
+  background:var(--dsw-alias-bg-layer-2,#ececf1); color:var(--dsw-alias-label-secondary,#6b6b76);
+  font-size:10px; line-height:16px; text-align:center; }
+.asa-team-empty { padding:14px 8px; font-size:12px; color:var(--dsw-alias-label-secondary,#6b6b76); }
+.asa-team-truncated { margin-top:8px; font-size:10.5px; color:var(--dsw-alias-state-warn-primary,#a4760c); }
+@media (max-width: 720px) {
+  .asa-team-panel { right:8px !important; }
+}
 @media (max-width: 860px) {
   .asa-body { grid-template-columns:minmax(0,1fr); grid-template-rows:minmax(0,1fr) minmax(0,1fr); overflow:auto; }
   .asa-col { min-height:320px; }
@@ -2638,6 +3058,19 @@ window.__ModuleLoader__.load({
                 key: PANEL_ID,
               },
               PageEntry,
+            ),
+          ),
+        )
+        disposers.push(
+          ctx.slots.inject('conversation.session.header.utilities', () =>
+            ctx.slots.register(
+              {
+                name: 'conversation.session.header.utilities',
+                id: 'agent-team',
+                order: 50,
+                label: () => t('team.button'),
+              },
+              AgentTeamButton,
             ),
           ),
         )

@@ -47,6 +47,7 @@ const ROUTE_BASE = '/api/dsh-agent-skill'
 const STATE_ROUTE = `${ROUTE_BASE}/state`
 const MODEL_ROUTE = `${ROUTE_BASE}/model`
 const SKILL_ROUTE = `${ROUTE_BASE}/skill`
+const TEAM_ROUTE = `${ROUTE_BASE}/team`
 const AGENT_SAVE_ROUTE = `${ROUTE_BASE}/agents/save`
 const AGENT_DELETE_ROUTE = `${ROUTE_BASE}/agents/delete`
 const AGENT_ARRANGE_ROUTE = `${ROUTE_BASE}/agents/arrange`
@@ -64,6 +65,7 @@ const MAX_INJECTED_SKILL_CHARS = 24_000
 const MAX_AGENT_NAME = 48
 const MAX_LISTED_SESSIONS = 400
 const MAX_TITLED_SESSIONS = 200
+const MAX_TEAM_NODES = 500
 
 /* ------------------------------------------------------------------ paths */
 
@@ -1227,6 +1229,79 @@ export function apply(ctx) {
     }
   }
 
+  const handleTeam = async (request, response) => {
+    if (!methodAllowed(request, response, ['GET', 'HEAD'])) return
+    const url = requestUrl(request)
+    const sessionId = (url?.searchParams.get('sessionId') ?? '').trim()
+    if (sessionId === '') {
+      sendJson(request, response, 400, { error: 'session-required' })
+      return
+    }
+    const subagents = useService(ctx, 'subagents')
+    if (!subagents || typeof subagents.listDescendants !== 'function') {
+      sendJson(request, response, 503, { error: 'team-unavailable' })
+      return
+    }
+    const sessionQuery = useService(ctx, 'sessionQuery')
+    let rootId = sessionId
+    if (sessionQuery && typeof sessionQuery.traceSession === 'function') {
+      try {
+        const trace = await sessionQuery.traceSession(sessionId)
+        if (trace?.complete === true) {
+          const traceRoot = trace.root?.header?.id
+          if (typeof traceRoot === 'string' && traceRoot !== '') rootId = traceRoot
+        }
+      } catch {
+        /* fall back to the current session */
+      }
+    }
+    let entries
+    try {
+      entries = await subagents.listDescendants(rootId)
+    } catch (error) {
+      logWarn(`team list failed: ${error instanceof Error ? error.message : String(error)}`)
+      sendJson(request, response, 500, { error: 'team-unavailable' })
+      return
+    }
+    const rows = Array.isArray(entries) ? entries : []
+    const nodes = rows
+      .slice(0, MAX_TEAM_NODES)
+      .map((entry) => ({
+        id: String(entry?.id ?? ''),
+        parentId: typeof entry?.parentId === 'string' ? entry.parentId : undefined,
+        depth: Number.isFinite(entry?.depth) ? entry.depth : 1,
+        path: typeof entry?.path === 'string' ? entry.path : undefined,
+        kind: entry?.kind === 'diagnostic' ? 'diagnostic' : 'child',
+        activity: entry?.activity === 'running' ? 'running' : 'inactive',
+        mode: typeof entry?.mode === 'string' ? entry.mode : 'unknown',
+        label: typeof entry?.label === 'string' ? entry.label : undefined,
+        name: typeof entry?.name === 'string' ? entry.name : undefined,
+        hasChildren: entry?.hasChildren === true,
+        reason: typeof entry?.reason === 'string' ? entry.reason : undefined,
+      }))
+      .filter((node) => node.id !== '')
+    let rootTitle
+    if (sessionQuery && typeof sessionQuery.readTitle === 'function') {
+      try {
+        const snapshot = await sessionQuery.readTitle(rootId)
+        // `readTitle` and `readTitleSnapshots` both wrap the string once more.
+        const value =
+          typeof snapshot?.title === 'string' ? snapshot.title : snapshot?.title?.title
+        if (typeof value === 'string' && value.trim() !== '') rootTitle = value.trim()
+      } catch {
+        /* the title is optional */
+      }
+    }
+    sendJson(request, response, 200, {
+      rootId,
+      currentId: sessionId,
+      rootTitle,
+      nodes,
+      truncated: rows.length > MAX_TEAM_NODES,
+      updatedAt: Date.now(),
+    })
+  }
+
   const handleModel = async (request, response) => {
     if (!methodAllowed(request, response, ['GET', 'HEAD'])) return
     const url = requestUrl(request)
@@ -1659,6 +1734,7 @@ export function apply(ctx) {
     ctx.effect(() => {
       const disposers = [
         webServer.register({ kind: 'exact', path: STATE_ROUTE, handler: fenced(handleState) }),
+        webServer.register({ kind: 'exact', path: TEAM_ROUTE, handler: fenced(handleTeam) }),
         webServer.register({ kind: 'exact', path: MODEL_ROUTE, handler: fenced(handleModel) }),
         webServer.register({ kind: 'exact', path: SKILL_ROUTE, handler: fenced(handleReadSkill) }),
         webServer.register({ kind: 'exact', path: AGENT_SAVE_ROUTE, handler: fenced(handleSaveAgent) }),

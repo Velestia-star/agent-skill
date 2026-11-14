@@ -11,6 +11,8 @@ The panel splits into two columns:
 
 Each column sorts independently: grab the six-dot handle on the left of a card, drag up or down, and a dashed slot opens between the other cards where the item will land. Release to insert it there. Dragging over the other column shows no slot and never changes that column. Moving the pointer out of the list removes the dashed slot and leaves no candidate position: releasing there writes nothing, while moving back inside resumes the same drag. Pressing `Esc`, a `pointercancel`, losing window focus or hiding the page cancels the whole drag and writes nothing. The handle is a real button, so clicking it never opens the card editor. The order is written to the plugin store and survives a refresh or restart.
 
+Every conversation header also carries an **Agent team** button immediately left of the three-dot menu. It opens a read-only tree of the conversation's subagents, rooted at the top-level conversation: branch connector lines, a green running / grey idle dot per node, a `Current` badge, a running/total summary, a 3-second refresh, and a scrollable body so a large branch can be wheeled through. The panel is independent of the shipped subagent catalog and is available in child conversations too; it highlights the conversation you are currently in.
+
 ## Requirements
 
 - DeepSeek Harness with the Web UI (the panel is a Client slot entry).
@@ -115,6 +117,7 @@ All routes are fenced to loopback requests (or a paired device) with same-origin
 | Method | Route | Purpose |
 |---|---|---|
 | `GET` | `/api/dsh-agent-skill/state` | Agents, skills, models, tools, workspaces, sessions, paths |
+| `GET` | `/api/dsh-agent-skill/team?sessionId=` | The conversation's subagent tree: root, current node, activity, mode, branch parent and diagnostics |
 | `GET` | `/api/dsh-agent-skill/model?provider=&model=` | Reasoning efforts and context window for one route |
 | `GET` | `/api/dsh-agent-skill/skill?path=` | Read one `SKILL.md` inside a managed root |
 | `POST` | `/api/dsh-agent-skill/agents/save` | Create or update a subagent |

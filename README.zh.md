@@ -11,6 +11,8 @@ DeepSeek Harness 的侧栏插件：自己造**子智能体**和**技能**，然�
 
 两栏各自独立排序：抓住卡片左侧的六点手柄上下拖动，其余卡片之间会撑开一个虚线空位，松手就插到那里。拖到另一栏不会出现空位，也不会改动那一栏。指针移出列表时虚线空位消失、不留候选位：在列表外松手不会写盘，移回列表内则继续同一次拖动。按 `Esc`、触发 pointercancel、窗口失焦或页面不可见都会取消整次拖动且不写盘。手柄是真正的按钮，点它不会打开卡片编辑。顺序写进插件存储，刷新或重启后保持。
 
+每个对话的会话头部、三个点菜单左边还有一个 **智能体团队** 按钮。点开是当前对话的子智能体只读树，根是顶层会话：有分支连线、每个节点一个绿色「工作中」/灰色「空闲」状态点、当前节点标记、工作中/总数摘要、每 3 秒刷新，树区域可滚轮上下翻。它独立于内置 subagent 目录，在子智能体自己的对话里也能打开，并高亮你当前所在的节点。
+
 ## 依赖
 
 - 带 Web UI 的 DeepSeek Harness（面板是 Client slot 入口）。
@@ -115,6 +117,7 @@ dsh plugin install /absolute/path/to/dsh-agent-skill
 | 方法 | 路由 | 用途 |
 |---|---|---|
 | `GET` | `/api/dsh-agent-skill/state` | 子智能体、技能、模型、工具、工作区、会话、路径 |
+| `GET` | `/api/dsh-agent-skill/team?sessionId=` | 当前对话的子智能体树：根、当前节点、活动状态、mode、分支父节点与诊断 |
 | `GET` | `/api/dsh-agent-skill/model?provider=&model=` | 某条模型路由的思考强度与上下文窗口 |
 | `GET` | `/api/dsh-agent-skill/skill?path=` | 读取托管根目录内的一份 `SKILL.md` |
 | `POST` | `/api/dsh-agent-skill/agents/save` | 新建或更新子智能体 |

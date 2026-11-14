@@ -20,6 +20,7 @@ const plugin = await import(new URL('../index.js', import.meta.url))
 
 const ROUTES = {
   state: '/api/dsh-agent-skill/state',
+  team: '/api/dsh-agent-skill/team',
   model: '/api/dsh-agent-skill/model',
   skill: '/api/dsh-agent-skill/skill',
   agentSave: '/api/dsh-agent-skill/agents/save',
@@ -44,6 +45,10 @@ function makeHarness({ workspaces = [], sessions = [], liveAgents = [] } = {}) {
     activation: undefined,
     section: undefined,
     commands: new Map(),
+    teamNodes: [],
+    teamError: false,
+    traceRoot: null,
+    rootTitle: 'Root conversation',
   }
 
   const services = {
@@ -72,6 +77,10 @@ function makeHarness({ workspaces = [], sessions = [], liveAgents = [] } = {}) {
     subagents: {
       getProvider: () => ({ name: 'spawn' }),
       resolveMaxDepth: (configured) => configured,
+      listDescendants: async () => {
+        if (state.teamError) throw new Error('team unavailable')
+        return state.teamNodes
+      },
       startActivation: async (spec) => {
         state.activation = spec
         return {
@@ -124,6 +133,17 @@ function makeHarness({ workspaces = [], sessions = [], liveAgents = [] } = {}) {
           status: 'fulfilled',
           value: { session: { id }, title: { title: `title:${id}` } },
         })),
+      traceSession: async (sessionId) => {
+        const rootId = state.traceRoot ?? sessionId
+        return {
+          target: { header: { id: sessionId } },
+          ancestors: [],
+          descendants: [],
+          complete: true,
+          root: { header: { id: rootId } },
+        }
+      },
+      readTitle: async () => ({ title: { title: state.rootTitle } }),
     },
     llm: {
       listProviders: () => [{ id: 'fake-provider', name: 'Fake Provider' }],
@@ -350,6 +370,82 @@ test('state route reports agents, skills, models, tools, workspaces and sessions
   assert.equal(json.sessions.find((session) => session.id === 'session-alpha').title, 'title:session-alpha')
   assert.equal(json.paths.globalSkills, path.join(root, 'dsh-home', 'skills'))
   assert.ok(json.tools.includes('delegate_agent') === false, 'delegate_agent is hidden from the tool picker')
+})
+
+test('team route returns the running and idle members of the conversation tree', async () => {
+  harness.state.traceRoot = null
+  harness.state.rootTitle = 'Root conversation'
+  harness.state.teamNodes = [
+    {
+      id: 'child-a',
+      parentId: 'session-alpha',
+      depth: 1,
+      path: 'lead/worker',
+      kind: 'child',
+      activity: 'running',
+      mode: 'continuable',
+      label: '研发主管',
+      hasChildren: true,
+    },
+    {
+      id: 'child-b',
+      parentId: 'child-a',
+      depth: 2,
+      kind: 'child',
+      activity: 'inactive',
+      mode: 'one-shot',
+      label: '执行体',
+      hasChildren: false,
+    },
+    {
+      id: 'child-c',
+      parentId: 'session-alpha',
+      depth: 1,
+      kind: 'diagnostic',
+      activity: 'inactive',
+      reason: 'corrupt',
+    },
+  ]
+  const { status, json } = await call(harness.state, `${ROUTES.team}?sessionId=session-alpha`)
+  assert.equal(status, 200)
+  assert.equal(json.rootId, 'session-alpha')
+  assert.equal(json.currentId, 'session-alpha')
+  assert.equal(json.rootTitle, 'Root conversation')
+  assert.equal(json.nodes.length, 3)
+  assert.equal(json.nodes[0].activity, 'running')
+  assert.equal(json.nodes[0].label, '研发主管')
+  assert.equal(json.nodes[1].activity, 'inactive')
+  assert.equal(json.nodes[2].kind, 'diagnostic')
+  assert.equal(json.nodes[2].reason, 'corrupt')
+  assert.equal(json.truncated, false)
+  harness.state.teamNodes = []
+})
+
+test('team route validates the session id, fence and descendant failures', async () => {
+  const missing = await call(harness.state, ROUTES.team)
+  assert.equal(missing.status, 400)
+  assert.equal(missing.json.error, 'session-required')
+
+  const crossOrigin = await call(harness.state, `${ROUTES.team}?sessionId=session-alpha`, {
+    headers: { origin: 'https://evil.example' },
+  })
+  assert.equal(crossOrigin.status, 403)
+
+  harness.state.teamError = true
+  const failed = await call(harness.state, `${ROUTES.team}?sessionId=session-alpha`)
+  assert.equal(failed.status, 500)
+  assert.equal(failed.json.error, 'team-unavailable')
+  harness.state.teamError = false
+})
+
+test('team route traces a child conversation back to its root', async () => {
+  harness.state.traceRoot = 'root-session'
+  harness.state.teamNodes = []
+  const { status, json } = await call(harness.state, `${ROUTES.team}?sessionId=child-session`)
+  assert.equal(status, 200)
+  assert.equal(json.rootId, 'root-session')
+  assert.equal(json.currentId, 'child-session')
+  harness.state.traceRoot = null
 })
 
 test('model route resolves reasoning efforts for one exact route', async () => {
