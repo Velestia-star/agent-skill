@@ -44,6 +44,8 @@ window.__ModuleLoader__.load({
       'team.expand': '展开',
       'team.collapse': '收起',
       'team.openSession': '点击打开该对话',
+      'team.thinkingTime': '思考时间',
+      'team.tokens': 'Token 用量',
       'team.error': '读取智能体团队失败',
       'team.retry': '重试',
       'team.loading': '读取中…',
@@ -221,6 +223,8 @@ window.__ModuleLoader__.load({
       'team.expand': 'Expand',
       'team.collapse': 'Collapse',
       'team.openSession': 'Open this conversation',
+      'team.thinkingTime': 'Thinking time',
+      'team.tokens': 'Token usage',
       'team.error': 'Could not read the agent team',
       'team.retry': 'Retry',
       'team.loading': 'Loading…',
@@ -434,6 +438,48 @@ window.__ModuleLoader__.load({
     function shortId(value) {
       const text = String(value ?? '')
       return text.length <= 10 ? text : text.slice(0, 8)
+    }
+
+    function teamTokenTotal(summary) {
+      const usage = summary?.projectionValues?.tokenUsage
+      if (usage === undefined || usage === null) return undefined
+      const total =
+        usage.uncachedInputTokens + usage.outputTokens + usage.cacheReadTokens + usage.cacheWriteTokens
+      return Number.isFinite(total) ? total : undefined
+    }
+
+    function teamActivityDuration(summary, activity, now) {
+      const timing = summary?.projectionValues?.subagentTiming
+      if (timing === undefined || timing === null) return undefined
+      if (timing.active === undefined) return timing.settledMs
+      const end = activity === 'running' ? now : timing.active.through
+      return timing.settledMs + Math.max(0, end - timing.active.since)
+    }
+
+    function formatTeamTokens(value) {
+      if (typeof value !== 'number' || !Number.isFinite(value)) return '—'
+      if (value >= 1e9) return `${(value / 1e9).toFixed(1)}B tok`
+      if (value >= 1e6) return `${(value / 1e6).toFixed(1)}M tok`
+      if (value >= 1e3) return `${(value / 1e3).toFixed(1)}K tok`
+      return `${Math.round(value)} tok`
+    }
+
+    function formatTeamDuration(ms) {
+      if (typeof ms !== 'number' || !Number.isFinite(ms)) return '—'
+      const totalSeconds = Math.floor(Math.max(0, ms) / 1000)
+      if (totalSeconds < 60) {
+        return currentLocaleIsZh ? `${totalSeconds}秒` : `${totalSeconds}s`
+      }
+      const minutes = Math.floor(totalSeconds / 60)
+      const seconds = totalSeconds % 60
+      if (minutes < 60) {
+        return currentLocaleIsZh
+          ? `${minutes}分${String(seconds).padStart(2, '0')}秒`
+          : `${minutes}m ${String(seconds).padStart(2, '0')}s`
+      }
+      const hours = Math.floor(minutes / 60)
+      const restMinutes = minutes % 60
+      return currentLocaleIsZh ? `${hours}小时${restMinutes}分` : `${hours}h ${restMinutes}m`
     }
 
     function byteLength(value) {
@@ -866,6 +912,7 @@ window.__ModuleLoader__.load({
 
     function AgentTeamButton(props) {
       const sessionId = typeof props?.sessionId === 'string' ? props.sessionId : ''
+      const sessionSummaries = props.useSessions((state) => state.byId)
       const [open, setOpen] = useState(false)
       const [status, setStatus] = useState('idle')
       const [data, setData] = useState(null)
@@ -1213,7 +1260,8 @@ window.__ModuleLoader__.load({
             typeof node.parentId === 'string' && node.parentId !== '' && node.mode !== 'unknown'
               ? { parentSessionId: node.parentId, childSessionId: node.id, mode: node.mode }
               : node.id
-          teamOpenSession(target)
+          const opened = teamOpenSession(target) !== false
+          if (!opened && target !== node.id) teamOpenSession(node.id)
           setOpen(false)
         },
         [],
@@ -1229,6 +1277,7 @@ window.__ModuleLoader__.load({
           loadedNodes.push(node)
         }
       }
+      const now = Date.now()
       const running = loadedNodes.filter((node) => node.kind === 'child' && node.activity === 'running').length
       const total = loadedNodes.filter((node) => node.kind === 'child').length
       const currentId = data?.currentId ?? sessionId
@@ -1250,9 +1299,15 @@ window.__ModuleLoader__.load({
         const diagnostic = node.kind === 'diagnostic'
         const expandable = !diagnostic && node.mode !== 'external'
         const label = node.label || node.name || shortId(id)
+        const summary = sessionSummaries?.[id]
+        const durationText = formatTeamDuration(teamActivityDuration(summary, node.activity, now))
+        const tokenText = formatTeamTokens(teamTokenTotal(summary))
         const meta = diagnostic
           ? t('team.diagnostic', { reason: node.reason ?? '' })
-          : `${node.mode || 'unknown'} · ${shortId(id)}`
+          : `${node.mode || 'unknown'} · ${durationText} · ${tokenText}`
+        const metaTitle = diagnostic
+          ? undefined
+          : `${t('team.thinkingTime')}: ${durationText} · ${t('team.tokens')}: ${tokenText}`
         return h(
           'li',
           {
@@ -1296,7 +1351,11 @@ window.__ModuleLoader__.load({
                 isCurrent
                   ? h('span', { key: 'current', className: 'asa-team-current' }, t('team.current'))
                   : null,
-                h('span', { key: 'meta', className: `asa-team-meta${diagnostic ? ' asa-team-warn' : ''}` }, meta),
+                h(
+                  'span',
+                  { key: 'meta', className: `asa-team-meta${diagnostic ? ' asa-team-warn' : ''}`, title: metaTitle },
+                  meta,
+                ),
                 loaded && children.length > 0
                   ? h('span', { key: 'count', className: 'asa-team-count' }, String(children.length))
                   : null,
@@ -3319,7 +3378,7 @@ window.__ModuleLoader__.load({
 .asa-team-current { flex:none; padding:0 5px; border-radius:999px; border:1px solid var(--dsw-alias-brand-primary,#3b6ef5);
   color:var(--dsw-alias-brand-primary,#3b6ef5); font-size:10px; line-height:16px; }
 .asa-team-meta { margin-left:auto; font-size:10.5px; color:var(--dsw-alias-label-secondary,#6b6b76);
-  white-space:nowrap; overflow:hidden; text-overflow:ellipsis; max-width:52%; }
+  white-space:nowrap; overflow:hidden; text-overflow:ellipsis; max-width:62%; font-variant-numeric:tabular-nums; }
 .asa-team-warn { color:var(--dsw-alias-state-warn-primary,#a4760c); }
 .asa-team-count { flex:none; min-width:16px; height:16px; padding:0 4px; border-radius:999px;
   background:var(--dsw-alias-bg-layer-2,#ececf1); color:var(--dsw-alias-label-secondary,#6b6b76);
@@ -3339,17 +3398,18 @@ window.__ModuleLoader__.load({
     /* ------------------------------------------------------------------ apply */
 
     return {
-      inject: ['slots'],
+      inject: ['slots', 'uiWorkspace'],
       apply(ctx) {
         const disposers = []
         try {
-          const uiWorkspace = ctx.get('uiWorkspace', false)
+          const uiWorkspace = ctx.uiWorkspace ?? ctx.get('uiWorkspace', false)
           if (uiWorkspace && typeof uiWorkspace.openSession === 'function') {
             teamOpenSession = (target) => {
               try {
                 uiWorkspace.openSession(target)
+                return true
               } catch {
-                /* navigation is best effort */
+                return false
               }
             }
           }
