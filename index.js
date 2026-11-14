@@ -1908,20 +1908,20 @@ export function apply(ctx) {
 
     let activation
     try {
+      // Current `subagents.startActivation` takes a flat spec (`parent`,
+      // `prompt`, `cwd`, `agentOptions`, `maxDepth` at the top level); the older
+      // nested `request` wrapper left `spec.parent` undefined.
       activation = await subagents.startActivation({
         provider,
         label,
         childId,
-        request: {
-          prompt: [{ type: 'text', text: prompt }],
-          parent,
-          signal: exec.signal,
-          ...(args?.cwd === undefined ? {} : { cwd: String(args.cwd) }),
-          ...(agentOptions === undefined ? {} : { agentOptions }),
-          ...(resolvedDepth === undefined ? {} : { maxDepth: resolvedDepth }),
-        },
+        parent,
+        prompt: [{ type: 'text', text: prompt }],
         signal: exec.signal,
         delivery: 'parent',
+        ...(args?.cwd === undefined ? {} : { cwd: String(args.cwd) }),
+        ...(agentOptions === undefined ? {} : { agentOptions }),
+        ...(resolvedDepth === undefined ? {} : { maxDepth: resolvedDepth }),
       })
     } catch (error) {
       await dropChildRule(childId)

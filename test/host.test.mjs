@@ -540,13 +540,14 @@ test('delegating a spawn agent injects the attached skill and honours the route'
   assert.equal(spec.childId, childId)
   assert.equal(spec.provider, 'spawn')
   assert.equal(spec.delivery, 'parent')
-  assert.deepEqual(spec.request.agentOptions, {
+  assert.equal(spec.parent.id, 'parent-session')
+  assert.deepEqual(spec.agentOptions, {
     provider: 'fake-provider',
     model: 'fake-model',
     reasoningEffort: 'low',
   })
-  assert.equal(spec.request.maxDepth, 1)
-  const prompt = spec.request.prompt[0].text
+  assert.equal(spec.maxDepth, 1)
+  const prompt = spec.prompt[0].text
   assert.match(prompt, /Reply exactly: PONG/)
   assert.match(prompt, /Do the thing\./)
 
@@ -570,7 +571,7 @@ test('delegating a fork agent selects the fork backend', async () => {
     { agent: { id: 'parent-session' }, signal: new AbortController().signal },
   )
   assert.equal(harness.state.activation.provider, 'fork')
-  assert.equal(harness.state.activation.request.agentOptions, undefined)
+  assert.equal(harness.state.activation.agentOptions, undefined)
 })
 
 test('a subagent answers to its display name and to a unique prefix', async () => {
@@ -631,7 +632,7 @@ test('the /chief command starts the chief subagent without a model turn', async 
   assert.match(started.text, /已交给 chief/)
   assert.match(started.text, /子会话/)
   assert.equal(harness.state.activation.provider, 'spawn')
-  assert.match(harness.state.activation.request.prompt[0].text, /把首页的保存按钮改成 loading 态/)
+  assert.match(harness.state.activation.prompt[0].text, /把首页的保存按钮改成 loading 态/)
 
   const empty = await command.handler(invoke('   '))
   assert.deepEqual(empty, { kind: 'error', text: '用法：/chief <任务>' })
@@ -856,7 +857,7 @@ test('delegation defers the depth policy to the host resolver', async () => {
       { agent: 'forker', prompt: 'x' },
       { agent: { id: 'parent-session' }, signal: new AbortController().signal },
     )
-    assert.equal(harness.state.activation.request.maxDepth, 0)
+    assert.equal(harness.state.activation.maxDepth, 0)
   } finally {
     harness.services.subagents.resolveMaxDepth = original
   }
