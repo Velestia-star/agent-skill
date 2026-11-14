@@ -1325,6 +1325,10 @@ export function apply(ctx) {
           kind: entry?.kind === 'diagnostic' ? 'diagnostic' : 'child',
           activity,
           mode: typeof entry?.mode === 'string' ? entry.mode : 'unknown',
+          createdAt:
+            typeof entry?.createdAt === 'number' && Number.isFinite(entry.createdAt)
+              ? entry.createdAt
+              : undefined,
           label: typeof entry?.label === 'string' ? entry.label : undefined,
           name: typeof entry?.name === 'string' ? entry.name : undefined,
           hasChildren: entry?.hasChildren === true,

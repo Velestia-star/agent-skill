@@ -425,6 +425,31 @@ test('team route returns the running and idle members of the conversation tree',
   harness.state.teamNodes = []
 })
 
+test('team route maps the catalog createdAt onto each node', async () => {
+  harness.state.traceRoot = null
+  harness.state.teamNodes = [
+    {
+      id: 'child-started',
+      activity: 'inactive',
+      mode: 'continuable',
+      label: '执行体',
+      createdAt: 1_700_000_123_456,
+    },
+    {
+      id: 'child-unstarted',
+      activity: 'inactive',
+      mode: 'one-shot',
+      label: '执行体',
+    },
+  ]
+  const { status, json } = await call(harness.state, `${ROUTES.team}?sessionId=session-alpha`)
+  assert.equal(status, 200)
+  assert.equal(json.nodes.length, 2)
+  assert.equal(json.nodes[0].createdAt, 1_700_000_123_456)
+  assert.equal(json.nodes[1].createdAt, undefined)
+  harness.state.teamNodes = []
+})
+
 test('team route validates the session id, fence and descendant failures', async () => {
   const missing = await call(harness.state, ROUTES.team)
   assert.equal(missing.status, 400)

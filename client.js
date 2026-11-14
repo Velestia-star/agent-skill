@@ -18,6 +18,44 @@ window.__ModuleLoader__.load({
     const API_SKILL_ARRANGE = '/api/dsh-agent-skill/skills/arrange'
     /** Set in apply(); SessionTarget is a SessionId or a subagent address. */
     let teamOpenSession = null
+    /**
+     * The team panel is a native <dialog> rendered inside the conversation
+     * header slot. Opening a member switches Session, and the new header may
+     * mount a fresh AgentTeamButton, so the panel would vanish. A short-lived
+     * hand-off flag lets the button of the target Session reopen it exactly
+     * once; the flag is keyed so no other Session can consume it.
+     */
+    let teamReopenPending = false
+    let teamReopenFor = ''
+    let teamReopenTimer = 0
+    const requestTeamReopen = (sessionId) => {
+      teamReopenPending = true
+      teamReopenFor = sessionId
+      try {
+        window.clearTimeout(teamReopenTimer)
+      } catch {
+        /* ignore */
+      }
+      try {
+        teamReopenTimer = window.setTimeout(() => {
+          teamReopenPending = false
+          teamReopenFor = ''
+        }, 8000)
+      } catch {
+        /* ignore */
+      }
+    }
+    const consumeTeamReopen = (sessionId) => {
+      if (!teamReopenPending || teamReopenFor !== sessionId) return false
+      teamReopenPending = false
+      teamReopenFor = ''
+      try {
+        window.clearTimeout(teamReopenTimer)
+      } catch {
+        /* ignore */
+      }
+      return true
+    }
 
     /* ------------------------------------------------------------ locale */
 
@@ -46,6 +84,7 @@ window.__ModuleLoader__.load({
       'team.openSession': '点击打开该对话',
       'team.thinkingTime': '思考时间',
       'team.tokens': 'Token 用量',
+      'team.startedAt': '开始时间',
       'team.error': '读取智能体团队失败',
       'team.retry': '重试',
       'team.loading': '读取中…',
@@ -225,6 +264,7 @@ window.__ModuleLoader__.load({
       'team.openSession': 'Open this conversation',
       'team.thinkingTime': 'Thinking time',
       'team.tokens': 'Token usage',
+      'team.startedAt': 'Started at',
       'team.error': 'Could not read the agent team',
       'team.retry': 'Retry',
       'team.loading': 'Loading…',
@@ -480,6 +520,21 @@ window.__ModuleLoader__.load({
       const hours = Math.floor(minutes / 60)
       const restMinutes = minutes % 60
       return currentLocaleIsZh ? `${hours}小时${restMinutes}分` : `${hours}h ${restMinutes}m`
+    }
+
+    function formatTeamStartedAt(value) {
+      if (typeof value !== 'number' || !Number.isFinite(value)) return '—'
+      const started = new Date(value)
+      const age = Date.now() - value
+      const pad = (n) => String(n).padStart(2, '0')
+      if (age < 24 * 60 * 60 * 1000) {
+        // Manual HH:MM: `hour12:false` can yield 24:00 at midnight in some
+        // engines, which is not the requested clock time.
+        return `${pad(started.getHours())}:${pad(started.getMinutes())}`
+      }
+      const monthDay = `${pad(started.getMonth() + 1)}-${pad(started.getDate())}`
+      if (age < 365 * 24 * 60 * 60 * 1000) return monthDay
+      return `${started.getFullYear()}-${monthDay}`
     }
 
     function byteLength(value) {
@@ -981,6 +1036,15 @@ window.__ModuleLoader__.load({
         })
       }, [])
 
+      // Reopen once for the Session a member click navigated to. When the
+      // header remounts, this button is the fresh one; when it survives the
+      // switch, `open` is already true and this only re-measures.
+      useEffect(() => {
+        if (!consumeTeamReopen(sessionId)) return
+        measure()
+        setOpen(true)
+      }, [measure, sessionId])
+
       const load = useCallback(async () => {
         if (sessionId === '') {
           setStatus('error')
@@ -1064,23 +1128,15 @@ window.__ModuleLoader__.load({
         }
       }, [sessionId])
 
+      // A refresh re-reads the root level only. `expanded` and the already
+      // loaded `branches` are kept, so the subtrees the user opened stay open;
+      // the root update in `load`'s polling branch replaces just the top level,
+      // and a parent that disappears simply stops rendering its branch.
+      // In-flight branch reads are left alone as well.
       const refreshTeam = useCallback(() => {
         pausedRef.current = false
-        hasDataRef.current = false
         revealedCurrentRef.current = ''
-        setExpanded({})
         setBranchErrors({})
-        setBranchLoading({})
-        for (const controller of branchAbortRef.current.values()) {
-          try {
-            controller.abort()
-          } catch {
-            /* ignore */
-          }
-        }
-        branchAbortRef.current.clear()
-        // Keep the last tree visible until the new root response replaces it;
-        // the reload clears the now-stale deeper branches itself.
         void load()
       }, [load])
 
@@ -1260,9 +1316,11 @@ window.__ModuleLoader__.load({
             typeof node.parentId === 'string' && node.parentId !== '' && node.mode !== 'unknown'
               ? { parentSessionId: node.parentId, childSessionId: node.id, mode: node.mode }
               : node.id
+          // `node.id` is the child Session the header will report next, so the
+          // reopen hand-off stays valid for both the address and the id fallback.
+          requestTeamReopen(node.id)
           const opened = teamOpenSession(target) !== false
           if (!opened && target !== node.id) teamOpenSession(node.id)
-          setOpen(false)
         },
         [],
       )
@@ -1304,10 +1362,10 @@ window.__ModuleLoader__.load({
         const tokenText = formatTeamTokens(teamTokenTotal(summary))
         const meta = diagnostic
           ? t('team.diagnostic', { reason: node.reason ?? '' })
-          : `${node.mode || 'unknown'} · ${durationText} · ${tokenText}`
-        const metaTitle = diagnostic
-          ? undefined
-          : `${t('team.thinkingTime')}: ${durationText} · ${t('team.tokens')}: ${tokenText}`
+          : `${tokenText} · ${durationText}`
+        // Hovering a conversation shows when it started, not the metrics that
+        // already sit in the visible meta text.
+        const metaTitle = `${t('team.startedAt')}: ${formatTeamStartedAt(node.createdAt)}`
         return h(
           'li',
           {
@@ -1320,7 +1378,7 @@ window.__ModuleLoader__.load({
             {
               className: 'asa-team-row',
               'data-current': isCurrent ? 'true' : 'false',
-              title: node.path || id,
+              title: metaTitle,
             },
             expandable
               ? h(
@@ -1368,7 +1426,7 @@ window.__ModuleLoader__.load({
                 {
                   type: 'button',
                   className: 'asa-team-open',
-                  title: t('team.openSession'),
+                  title: metaTitle,
                   onClick: (event) => {
                     event.preventDefault()
                     event.stopPropagation()
